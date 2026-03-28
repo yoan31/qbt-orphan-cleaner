@@ -236,6 +236,7 @@ input[type=checkbox]{width:15px;height:15px;accent-color:#5b8dee;cursor:pointer;
 .toast.ok{background:#14532d;border:1px solid #22c55e;color:#86efac}
 .toast.err{background:#450a0a;border:1px solid #ef4444;color:#fca5a5}
 @keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.ver-badge{background:#1a2340;border:1px solid #2a3a5a;color:#5b8dee;border-radius:999px;padding:2px 8px;font-size:11px;margin-left:auto;white-space:nowrap}
 .hidden{display:none!important}
 @media(max-width:600px){header{padding:0 12px}main{padding:12px 8px}.hd-right .status{display:none}.subheader{padding:6px 12px}}
 </style>
@@ -245,7 +246,7 @@ input[type=checkbox]{width:15px;height:15px;accent-color:#5b8dee;cursor:pointer;
 <header>
   <div class="hd-left">
     <span class="logo">&#129529;</span>
-    <h1>qBt Orphan Cleaner <span style="font-size:11px;color:#64748b;font-weight:400">v""" + __version__ + """</span></h1>
+    <h1>qBt Orphan Cleaner</h1>
   </div>
   <div class="hd-right">
     <div class="status">
@@ -253,7 +254,7 @@ input[type=checkbox]{width:15px;height:15px;accent-color:#5b8dee;cursor:pointer;
       <span id="status-txt">&ndash;</span>
     </div>
     <button class="btn btn-secondary" id="btn-cfg">&#9881; Config</button>
-    <button class="btn btn-primary" id="btn-scan">&#8635; Scanner</button>
+    <button class="btn btn-primary" id="btn-scan">&#8635; Scan</button>
   </div>
 </header>
 
@@ -261,32 +262,33 @@ input[type=checkbox]{width:15px;height:15px;accent-color:#5b8dee;cursor:pointer;
   <span id="info-storage">&ndash;</span>
   <span class="sep">&middot;</span>
   <span id="info-qbt">&ndash;</span>
+  <span class="ver-badge">v""" + __version__ + """</span>
 </div>
 
 <main>
   <div id="v-loading" class="center">
     <div class="spinner"></div>
-    <span>Scan en cours&hellip;</span>
+    <span>Scanning&hellip;</span>
   </div>
   <div id="v-empty" class="center hidden">
     <div class="icon-circle icon-ok">&#10003;</div>
-    <h2>Stockage propre</h2>
-    <p>Aucun fichier orphelin d&eacute;tect&eacute;.</p>
+    <h2>Storage clean</h2>
+    <p>No orphan files detected.</p>
   </div>
   <div id="v-error" class="center hidden">
     <div class="icon-circle icon-err">&#10007;</div>
-    <h2>Erreur</h2>
-    <p id="error-msg">Impossible de contacter qBittorrent.</p>
+    <h2>Error</h2>
+    <p id="error-msg">Unable to reach qBittorrent.</p>
   </div>
   <div id="v-results" class="hidden">
     <div class="toolbar">
       <label class="tb-left">
         <input type="checkbox" id="sel-all">
-        <span>Tout s&eacute;lectionner</span>
+        <span>Select all</span>
       </label>
       <div class="tb-right">
         <span class="stats" id="sel-info"></span>
-        <button class="btn btn-danger" id="btn-del" disabled>&#128465; Supprimer</button>
+        <button class="btn btn-danger" id="btn-del" disabled>&#128465; Delete</button>
       </div>
     </div>
     <div id="orphan-list" class="orphan-list"></div>
@@ -297,16 +299,16 @@ input[type=checkbox]{width:15px;height:15px;accent-color:#5b8dee;cursor:pointer;
   </div>
 </main>
 
-<!-- Modal confirmation suppression -->
+<!-- Delete confirmation modal -->
 <div class="modal hidden" id="modal">
   <div class="modal-bd" id="modal-bd"></div>
   <div class="modal-box">
-    <h2>&#9888; Confirmer la suppression</h2>
+    <h2>&#9888; Confirm deletion</h2>
     <p id="modal-sum"></p>
     <div class="modal-list" id="modal-list"></div>
     <div class="modal-actions">
-      <button class="btn btn-secondary" id="modal-cancel">Annuler</button>
-      <button class="btn btn-danger" id="modal-ok">Supprimer d&eacute;finitivement</button>
+      <button class="btn btn-secondary" id="modal-cancel">Cancel</button>
+      <button class="btn btn-danger" id="modal-ok">Delete permanently</button>
     </div>
   </div>
 </div>
@@ -315,38 +317,38 @@ input[type=checkbox]{width:15px;height:15px;accent-color:#5b8dee;cursor:pointer;
 <div class="modal hidden" id="cfg-modal">
   <div class="modal-bd" id="cfg-modal-bd"></div>
   <div class="modal-box" style="max-width:420px">
-    <h2>&#9881; Configuration</h2>
-    <p style="margin-bottom:20px">Modifiez les param&egrave;tres ci-dessous. La configuration est sauvegard&eacute;e dans le fichier <code>.env</code>.</p>
+    <h2>&#9881; Settings</h2>
+    <p style="margin-bottom:20px">Edit the settings below. Configuration is saved to the <code>.env</code> file.</p>
     <div class="cfg-grid">
       <div class="cfg-row">
-        <label>qBittorrent &mdash; h&ocirc;te</label>
-        <input id="cfg-QB_HOST" type="text" placeholder="http://192.168.1.149">
+        <label>qBittorrent &mdash; host</label>
+        <input id="cfg-QB_HOST" type="text" placeholder="http://192.168.1.x">
       </div>
       <div class="cfg-row">
         <label>qBittorrent &mdash; port</label>
         <input id="cfg-QB_PORT" type="number" placeholder="8080">
       </div>
       <div class="cfg-row">
-        <label>Utilisateur</label>
+        <label>Username</label>
         <input id="cfg-QB_USER" type="text" placeholder="admin">
       </div>
       <div class="cfg-row">
-        <label>Mot de passe</label>
-        <input id="cfg-QB_PASS" type="password" placeholder="••••••••">
+        <label>Password</label>
+        <input id="cfg-QB_PASS" type="password" placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;">
       </div>
       <div class="cfg-row">
-        <label>R&eacute;pertoire de stockage</label>
+        <label>Storage directory</label>
         <input id="cfg-STORAGE_DIR" type="text" placeholder="/mnt/downloads">
       </div>
       <div class="cfg-row">
-        <label>Port web</label>
+        <label>Web port</label>
         <input id="cfg-WEB_PORT" type="number" placeholder="9090">
       </div>
     </div>
-    <p class="cfg-note">&#9432;&nbsp; Le changement de port web n&eacute;cessite un red&eacute;marrage du serveur.</p>
+    <p class="cfg-note">&#9432;&nbsp; Changing the web port requires a server restart.</p>
     <div class="modal-actions">
-      <button class="btn btn-secondary" id="cfg-cancel">Annuler</button>
-      <button class="btn btn-primary" id="cfg-save">&#10003; Sauvegarder</button>
+      <button class="btn btn-secondary" id="cfg-cancel">Cancel</button>
+      <button class="btn btn-primary" id="cfg-save">&#10003; Save</button>
     </div>
   </div>
 </div>
@@ -364,7 +366,7 @@ let browseOpen = new Set(); // abs_path of open panels
 
 function fmtSize(b) {
   if (b < 0) return '\u2026';
-  const u = ['o','Ko','Mo','Go','To'];
+  const u = ['B','KB','MB','GB','TB'];
   let i = 0;
   while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
   return b.toFixed(1) + '\u00a0' + u[i];
@@ -394,13 +396,13 @@ function updateSel() {
   btn.disabled = n === 0;
   if (n > 0) {
     btn.textContent = anyUnknown
-      ? '🗑 Supprimer (' + n + ')'
-      : '🗑 Supprimer (' + fmtSize(sz) + ')';
+      ? '🗑 Delete (' + n + ')'
+      : '🗑 Delete (' + fmtSize(sz) + ')';
   } else {
-    btn.textContent = '🗑 Supprimer';
+    btn.textContent = '🗑 Delete';
   }
   $('sel-info').textContent = n > 0
-    ? n + ' s\u00e9lectionn\u00e9(s)' + (anyUnknown ? '' : ' \u00b7 ' + fmtSize(sz))
+    ? n + ' selected' + (anyUnknown ? '' : ' \u00b7 ' + fmtSize(sz))
     : '';
   rowMap.forEach((row, path) => row.classList.toggle('sel', selected.has(path)));
 }
@@ -423,8 +425,8 @@ function renderOrphans(data) {
   $('info-storage').textContent = '📂 ' + data.storage_dir;
   $('info-qbt').textContent = '🔗 ' + data.qbt_url;
   $('dot').className = 'status-dot ok';
-  $('status-txt').textContent = 'Connect\u00e9';
-  $('ttl-count').textContent = orphans.length + ' orphelin(s)';
+  $('status-txt').textContent = 'Connected';
+  $('ttl-count').textContent = orphans.length + ' orphan(s)';
   $('ttl-size').textContent = '\u2026';
 
   const list = $('orphan-list');
@@ -492,7 +494,7 @@ function renderOrphans(data) {
         expDiv.className = 'c-exp';
         const expBtn = document.createElement('button');
         expBtn.className = 'btn-exp';
-        expBtn.title = 'Explorer le dossier';
+        expBtn.title = 'Browse folder';
         expBtn.textContent = '\u25B6';
         expBtn.addEventListener('click', e => {
           e.stopPropagation();
@@ -543,9 +545,9 @@ async function fetchSizes() {
         if (el) el.textContent = s.size_human;
       }
     });
-    $('ttl-size').textContent = fmtSize(total) + ' r\u00e9cup\u00e9rables';
+    $('ttl-size').textContent = fmtSize(total) + ' recoverable';
     updateSel();
-  } catch(_) { /* sizes indisponibles */ }
+  } catch(_) { /* sizes unavailable */ }
 }
 
 // ── Scan ────────────────────────────────────────────────────
@@ -557,7 +559,7 @@ async function doScan() {
     const data = await r.json();
     if (data.error) {
       $('dot').className = 'status-dot err';
-      $('status-txt').textContent = 'Erreur';
+      $('status-txt').textContent = 'Error';
       $('error-msg').textContent = data.error;
       show('v-error');
     } else {
@@ -565,7 +567,7 @@ async function doScan() {
     }
   } catch(e) {
     $('dot').className = 'status-dot err';
-    $('error-msg').textContent = 'Erreur r\u00e9seau\u00a0: ' + e.message;
+    $('error-msg').textContent = 'Network error: ' + e.message;
     show('v-error');
   } finally {
     $('btn-scan').disabled = false;
@@ -601,7 +603,7 @@ async function toggleBrowse(path, btn, list, row) {
     } else if (!Array.isArray(entries) || entries.length === 0) {
       const d = document.createElement('div');
       d.className = 'bp-item';
-      d.textContent = 'Dossier vide';
+      d.textContent = 'Empty folder';
       panel.appendChild(d);
     } else {
       entries.forEach(e => {
@@ -624,7 +626,7 @@ async function toggleBrowse(path, btn, list, row) {
     browseOpen.add(path);
     btn.classList.add('open');
   } catch(e) {
-    toast('Erreur exploration\u00a0: ' + e.message, 'err');
+    toast('Browse error: ' + e.message, 'err');
   } finally {
     btn.disabled = false;
     btn.textContent = '\u25B6';
@@ -636,9 +638,9 @@ function openModal() {
   const sel = orphans.filter(o => selected.has(o.abs_path));
   const sz  = sel.reduce((s,o) => s + Math.max(0, o.size), 0);
   const unknownSz = sel.some(o => o.size < 0);
-  $('modal-sum').textContent = sel.length + ' \u00e9l\u00e9ment(s)'
+  $('modal-sum').textContent = sel.length + ' item(s)'
     + (unknownSz ? '' : ' \u00b7 ' + fmtSize(sz))
-    + ' supprim\u00e9(s) de fa\u00e7on irr\u00e9versible.';
+    + ' will be permanently deleted.';
   const ml = $('modal-list');
   ml.innerHTML = '';
   sel.forEach(o => {
@@ -674,17 +676,17 @@ async function doDelete() {
       if (!orphans.some(o => (o.category||'') === sep.dataset.cat)) sep.remove();
     });
     const remaining = orphans.reduce((s,o) => s + Math.max(0,o.size), 0);
-    $('ttl-count').textContent = orphans.length + ' orphelin(s)';
-    $('ttl-size').textContent = fmtSize(remaining) + ' r\u00e9cup\u00e9rables';
+    $('ttl-count').textContent = orphans.length + ' orphan(s)';
+    $('ttl-size').textContent = fmtSize(remaining) + ' recoverable';
     if (orphans.length === 0) show('v-empty');
     updateSel();
     if (data.errors.length === 0) {
-      toast('\u2713 ' + data.deleted.length + ' \u00e9l\u00e9ment(s) supprim\u00e9(s)', 'ok');
+      toast('\u2713 ' + data.deleted.length + ' item(s) deleted', 'ok');
     } else {
-      toast(data.deleted.length + ' supprim\u00e9(s), ' + data.errors.length + ' erreur(s)', 'err');
+      toast(data.deleted.length + ' deleted, ' + data.errors.length + ' error(s)', 'err');
     }
   } catch(e) {
-    toast('Erreur r\u00e9seau\u00a0: ' + e.message, 'err');
+    toast('Network error: ' + e.message, 'err');
   } finally {
     $('btn-scan').disabled = false;
   }
@@ -699,7 +701,7 @@ async function openConfig() {
       const el = $('cfg-' + k);
       if (el) el.value = cfg[k] || '';
     });
-  } catch(e) { toast('Erreur chargement config', 'err'); return; }
+  } catch(e) { toast('Error loading settings', 'err'); return; }
   $('cfg-modal').classList.remove('hidden');
 }
 async function saveConfig() {
@@ -717,12 +719,12 @@ async function saveConfig() {
     const data = await r.json();
     if (data.ok) {
       $('cfg-modal').classList.add('hidden');
-      toast('Configuration sauvegard\u00e9e \u2013 rescan en cours\u2026', 'ok', 2500);
+      toast('Settings saved \u2013 rescanning\u2026', 'ok', 2500);
       doScan();
     } else {
-      toast(data.error || 'Erreur de sauvegarde', 'err');
+      toast(data.error || 'Failed to save settings', 'err');
     }
-  } catch(e) { toast('Erreur r\u00e9seau\u00a0: ' + e.message, 'err'); }
+  } catch(e) { toast('Network error: ' + e.message, 'err'); }
 }
 
 // ── Event listeners ─────────────────────────────────────────

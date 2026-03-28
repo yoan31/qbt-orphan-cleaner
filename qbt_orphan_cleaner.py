@@ -44,8 +44,8 @@ _load_env()
 # ─────────────────────────────────────────────
 #  CONFIGURATION  (via .env ou variables d'environnement)
 # ─────────────────────────────────────────────
-QB_HOST     = os.environ.get("QB_HOST", "http://192.168.1.149")
-QB_PORT     = int(os.environ.get("QB_PORT", "8090"))
+QB_HOST     = os.environ.get("QB_HOST", "http://localhost")
+QB_PORT     = int(os.environ.get("QB_PORT", "8080"))
 QB_USER     = os.environ.get("QB_USER", "admin")
 QB_PASS     = os.environ.get("QB_PASS", "adminadmin")
 STORAGE_DIR = os.environ.get("STORAGE_DIR", "/mnt/downloads")
@@ -315,8 +315,8 @@ def reload_config():
     for k in ("QB_HOST", "QB_PORT", "QB_USER", "QB_PASS", "STORAGE_DIR"):
         os.environ.pop(k, None)
     _load_env()
-    QB_HOST     = os.environ.get("QB_HOST", "http://192.168.1.149")
-    QB_PORT     = int(os.environ.get("QB_PORT", "8090"))
+    QB_HOST     = os.environ.get("QB_HOST", "http://localhost")
+    QB_PORT     = int(os.environ.get("QB_PORT", "8080"))
     QB_USER     = os.environ.get("QB_USER", "admin")
     QB_PASS     = os.environ.get("QB_PASS", "adminadmin")
     STORAGE_DIR = os.environ.get("STORAGE_DIR", "/mnt/downloads")

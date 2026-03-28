@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import qbt_orphan_cleaner as _qbt
 
-WEB_PORT = int(os.environ.get("WEB_PORT", "8080"))
+WEB_PORT = int(os.environ.get("WEB_PORT", "9090"))
 WEB_HOST = os.environ.get("WEB_HOST", "0.0.0.0")
 __version__ = _qbt.__version__
 
@@ -324,7 +324,7 @@ input[type=checkbox]{width:15px;height:15px;accent-color:#5b8dee;cursor:pointer;
       </div>
       <div class="cfg-row">
         <label>qBittorrent &mdash; port</label>
-        <input id="cfg-QB_PORT" type="number" placeholder="8090">
+        <input id="cfg-QB_PORT" type="number" placeholder="8080">
       </div>
       <div class="cfg-row">
         <label>Utilisateur</label>
@@ -340,7 +340,7 @@ input[type=checkbox]{width:15px;height:15px;accent-color:#5b8dee;cursor:pointer;
       </div>
       <div class="cfg-row">
         <label>Port web</label>
-        <input id="cfg-WEB_PORT" type="number" placeholder="8080">
+        <input id="cfg-WEB_PORT" type="number" placeholder="9090">
       </div>
     </div>
     <p class="cfg-note">&#9432;&nbsp; Le changement de port web n&eacute;cessite un red&eacute;marrage du serveur.</p>

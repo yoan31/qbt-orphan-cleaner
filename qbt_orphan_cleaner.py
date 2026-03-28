@@ -182,7 +182,7 @@ def scan_storage(directory, category_dirs):
 
 
 def format_size(size_bytes):
-    for unit in ("o", "Ko", "Mo", "Go", "To"):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
         if size_bytes < 1024:
             return f"{size_bytes:.1f} {unit}"
         size_bytes /= 1024

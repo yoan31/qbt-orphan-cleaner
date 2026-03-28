@@ -1,0 +1,14 @@
+# Caliber local state
+.caliber/
+
+# Claude Code local state
+.claude/
+
+# Config locale avec credentials
+.env
+
+# Venv
+.venv/
+
+__pycache__/
+*.pyc

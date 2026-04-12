@@ -9,13 +9,16 @@ Dépendances : aucune (stdlib uniquement)
 """
 
 import argparse
-import os
-import sys
+import csv
 import json
-import urllib.request
-import urllib.parse
-import urllib.error
 import http.cookiejar
+import io
+import os
+import shutil
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 
 
 __version__ = "1.0.0"
@@ -23,7 +26,6 @@ __version__ = "1.0.0"
 
 class QbtError(Exception):
     """Erreur de communication avec qBittorrent ou de configuration."""
-    pass
 
 
 def _load_env():
@@ -44,14 +46,14 @@ _load_env()
 # ─────────────────────────────────────────────
 #  CONFIGURATION  (via .env ou variables d'environnement)
 # ─────────────────────────────────────────────
-QB_HOST     = os.environ.get("QB_HOST", "http://localhost")
-QB_PORT     = int(os.environ.get("QB_PORT", "8080"))
-QB_USER     = os.environ.get("QB_USER", "admin")
-QB_PASS     = os.environ.get("QB_PASS", "adminadmin")
+QB_HOST = os.environ.get("QB_HOST", "http://localhost")
+QB_PORT = int(os.environ.get("QB_PORT", "8080"))
+QB_USER = os.environ.get("QB_USER", "admin")
+QB_PASS = os.environ.get("QB_PASS", "adminadmin")
 STORAGE_DIR = os.environ.get("STORAGE_DIR", "/mnt/downloads")
 
 IGNORE_EXTENSIONS = {".!qB", ".parts", ".tmp"}
-IGNORE_NAMES      = {".DS_Store", "Thumbs.db", "desktop.ini", "images", "template"}
+IGNORE_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini", "images", "template"}
 # ─────────────────────────────────────────────
 
 
@@ -94,6 +96,7 @@ class QBittorrentClient:
     def get_torrents(self):
         raw = self._get("/api/v2/torrents/info")
         return json.loads(raw)
+
 
 def collect_known_files(client):
     """
@@ -189,6 +192,31 @@ def format_size(size_bytes):
     return f"{size_bytes:.1f} Po"
 
 
+def export_report(orphans, path):
+    """Exporte la liste des orphelins en CSV ou JSON selon l'extension de `path`."""
+    ext = os.path.splitext(path)[1].lower()
+    norm_storage = os.path.normpath(STORAGE_DIR)
+    rows = [
+        {
+            "type": "dir" if entry.is_dir() else "file",
+            "name": entry.name,
+            "rel_path": os.path.relpath(entry.path, norm_storage),
+            "abs_path": entry.path,
+            "size_bytes": size,
+            "size_human": format_size(size),
+        }
+        for entry, size in orphans
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        if ext == ".json":
+            json.dump(rows, f, ensure_ascii=False, indent=2)
+        else:
+            writer = csv.DictWriter(f, fieldnames=["type", "name", "rel_path", "abs_path", "size_bytes", "size_human"])
+            writer.writeheader()
+            writer.writerows(rows)
+    print(f"[INFO] Rapport exporté → {path} ({len(rows)} entrée(s))")
+
+
 def get_entry_size(entry):
     try:
         if entry.is_file(follow_symlinks=False):
@@ -239,7 +267,7 @@ def interactive_cleanup(orphans):
 
         elif choice == "a":
             confirm = input(f"⚠️  Supprimer les {len(orphans)} entrées ? (oui/non) : ").strip().lower()
-            if confirm == "oui":
+            if confirm in {"oui", "yes", "y"}:
                 _delete_entries([e for e, _ in orphans])
             else:
                 print("Annulé.")
@@ -257,7 +285,7 @@ def interactive_cleanup(orphans):
                 if selected:
                     names = ", ".join(e.name for e in selected)
                     confirm = input(f"Supprimer : {names} ? (oui/non) : ").strip().lower()
-                    if confirm == "oui":
+                    if confirm in {"oui", "yes", "y"}:
                         _delete_entries(selected)
                     else:
                         print("Annulé.")
@@ -266,7 +294,6 @@ def interactive_cleanup(orphans):
 
 
 def _delete_entries(entries):
-    import shutil
     for entry in entries:
         try:
             if entry.is_dir(follow_symlinks=False):
@@ -315,18 +342,24 @@ def reload_config():
     for k in ("QB_HOST", "QB_PORT", "QB_USER", "QB_PASS", "STORAGE_DIR"):
         os.environ.pop(k, None)
     _load_env()
-    QB_HOST     = os.environ.get("QB_HOST", "http://localhost")
-    QB_PORT     = int(os.environ.get("QB_PORT", "8080"))
-    QB_USER     = os.environ.get("QB_USER", "admin")
-    QB_PASS     = os.environ.get("QB_PASS", "adminadmin")
+    QB_HOST = os.environ.get("QB_HOST", "http://localhost")
+    QB_PORT = int(os.environ.get("QB_PORT", "8080"))
+    QB_USER = os.environ.get("QB_USER", "admin")
+    QB_PASS = os.environ.get("QB_PASS", "adminadmin")
     STORAGE_DIR = os.environ.get("STORAGE_DIR", "/mnt/downloads")
-    BASE_URL    = f"{QB_HOST}:{QB_PORT}"
+    BASE_URL = f"{QB_HOST}:{QB_PORT}"
 
 
 def main():
     parser = argparse.ArgumentParser(description="qBittorrent Orphan Cleaner")
     parser.add_argument("--debug", action="store_true",
                         help="Pour chaque orphelin, affiche les données brutes de l'API qBittorrent")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Liste les orphelins sans rien supprimer")
+    parser.add_argument("--auto-delete", action="store_true",
+                        help="Supprime tous les orphelins sans interaction (pour cron)")
+    parser.add_argument("--output", metavar="FILE",
+                        help="Exporte les orphelins en CSV ou JSON (.csv / .json)")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -351,11 +384,11 @@ def main():
         sys.exit(1)
     print(f"[INFO] {len(entries)} entrée(s) trouvée(s) dans {STORAGE_DIR}")
 
-    orphans = []
-    for entry in entries:
-        if entry.name not in known_names:
-            size = get_entry_size(entry)
-            orphans.append((entry, size))
+    orphans = [
+        (entry, get_entry_size(entry))
+        for entry in entries
+        if entry.name not in known_names
+    ]
 
     if args.debug:
         norm_storage = os.path.normpath(STORAGE_DIR)
@@ -387,6 +420,32 @@ def main():
 
     if not orphans:
         print("\n[✓] Aucun fichier orphelin. Le stockage est propre !")
+        sys.exit(0)
+
+    # Export optionnel avant toute action
+    if args.output:
+        export_report(orphans, args.output)
+
+    # --dry-run : afficher uniquement, sans supprimer
+    if args.dry_run:
+        norm_storage = os.path.normpath(STORAGE_DIR)
+        print("\n" + "─" * 60)
+        print("  MODE DRY-RUN — aucune suppression effectuée")
+        print("─" * 60)
+        total = 0
+        for i, (entry, size) in enumerate(orphans, 1):
+            kind = "📁" if entry.is_dir() else "📄"
+            rel = os.path.relpath(entry.path, norm_storage)
+            print(f"  [{i:>3}] {kind} {rel}  ({format_size(size)})")
+            total += size
+        print(f"\n  Taille totale récupérable : {format_size(total)}")
+        print("─" * 60)
+        sys.exit(0)
+
+    # --auto-delete : suppression directe sans interaction
+    if args.auto_delete:
+        print(f"\n[AUTO] Suppression de {len(orphans)} orphelin(s)…")
+        _delete_entries([e for e, _ in orphans])
         sys.exit(0)
 
     interactive_cleanup(orphans)

@@ -32,6 +32,9 @@ QB_USER=admin
 QB_PASS=your_password
 STORAGE_DIR=/mnt/downloads
 WEB_PORT=9090
+# Optional: only when exposing outside localhost
+WEB_HOST=127.0.0.1
+WEB_AUTH=user:strong_password
 ```
 
 > `QB_PORT=8080` is qBittorrent's default WebUI port. `WEB_PORT=9090` is the port for this tool's own web interface.
@@ -66,12 +69,12 @@ The web interface lets you:
 ## 🔍 How it works
 
 1. 🔐 **Login** — authenticates against qBittorrent WebUI
-2. 📋 **Collect known names** — fetches all torrents via `/api/v2/torrents/info`; builds a set of known basenames (`name` field + `basename(content_path)`)
+2. 📋 **Collect known names** — fetches all torrents via `/api/v2/torrents/info`; builds known basenames (`name` field + `basename(content_path)`) scoped by storage root or detected category
 3. 🗄️ **Scan storage** — lists direct children of `STORAGE_DIR`; also lists contents of detected category subdirectories (one level deep)
-4. 🔎 **Diff** — anything on disk whose name is not in the known set is flagged as an orphan
+4. 🔎 **Diff** — anything on disk whose name is not known in the same scope is flagged as an orphan
 5. 🗑️ **Cleanup** — interactive deletion with size display and confirmation
 
-> **Note:** Comparison is basename-only, which makes it work correctly with a remote qBittorrent instance whose paths differ from the local mount point.
+> **Note:** Comparison uses basenames scoped by category. Categories are detected from `basename(save_path)` when it matches a local subfolder, which keeps the tool compatible with a remote qBittorrent instance whose full paths differ from the local mount point.
 
 ## ⚙️ Configuration
 
@@ -85,6 +88,8 @@ All settings can be placed in a `.env` file next to the scripts, or set as envir
 | `QB_PASS` | `adminadmin` | WebUI password |
 | `STORAGE_DIR` | `/mnt/downloads` | Root directory to scan |
 | `WEB_PORT` | `9090` | Port for this tool's web interface |
+| `WEB_HOST` | `127.0.0.1` | Bind address for the web interface. Use `0.0.0.0` only with `WEB_AUTH`. |
+| `WEB_AUTH` | unset | Optional Basic Auth credentials as `user:password`; required when `WEB_HOST` is not localhost. |
 
 Files and folders always ignored during scan: `.!qB`, `.parts`, `.tmp`, `.DS_Store`, `Thumbs.db`, `desktop.ini`, `images`, `template`, and any hidden entry (name starts with `.`).
 
@@ -124,6 +129,9 @@ QB_USER=admin
 QB_PASS=votre_mot_de_passe
 STORAGE_DIR=/mnt/downloads
 WEB_PORT=9090
+# Optionnel : uniquement pour exposer hors localhost
+WEB_HOST=127.0.0.1
+WEB_AUTH=user:mot_de_passe_fort
 ```
 
 > `QB_PORT=8080` est le port WebUI par défaut de qBittorrent. `WEB_PORT=9090` est le port de l'interface web de cet outil.
@@ -158,12 +166,12 @@ L'interface web permet de :
 ## 🔍 Fonctionnement
 
 1. 🔐 **Connexion** — authentification auprès de la WebUI qBittorrent
-2. 📋 **Collecte des noms connus** — récupère tous les torrents via `/api/v2/torrents/info` ; construit un ensemble de basenames connus (`name` + `basename(content_path)`)
+2. 📋 **Collecte des noms connus** — récupère tous les torrents via `/api/v2/torrents/info` ; construit les basenames connus (`name` + `basename(content_path)`) par portée : racine du stockage ou catégorie détectée
 3. 🗄️ **Scan du stockage** — liste les enfants directs de `STORAGE_DIR` ; explore aussi les sous-dossiers de catégorie détectés (un niveau de profondeur)
-4. 🔎 **Différence** — tout ce qui est sur le disque et absent de l'ensemble connu est signalé comme orphelin
+4. 🔎 **Différence** — tout ce qui est sur le disque et absent des noms connus dans la même portée est signalé comme orphelin
 5. 🗑️ **Nettoyage** — suppression interactive avec affichage des tailles et confirmation
 
-> **Note :** La comparaison se fait sur le basename uniquement, ce qui fonctionne correctement avec une instance qBittorrent distante dont les chemins diffèrent du point de montage local.
+> **Note :** La comparaison se fait sur les basenames par catégorie. Les catégories sont détectées via `basename(save_path)` lorsqu'il correspond à un sous-dossier local, ce qui reste compatible avec une instance qBittorrent distante dont les chemins complets diffèrent du point de montage local.
 
 ## ⚙️ Configuration
 
@@ -177,5 +185,7 @@ Tous les paramètres peuvent être placés dans un fichier `.env` à côté des 
 | `QB_PASS` | `adminadmin` | Mot de passe WebUI |
 | `STORAGE_DIR` | `/mnt/downloads` | Répertoire racine à analyser |
 | `WEB_PORT` | `9090` | Port de l'interface web de cet outil |
+| `WEB_HOST` | `127.0.0.1` | Adresse d'écoute de l'interface web. Utiliser `0.0.0.0` uniquement avec `WEB_AUTH`. |
+| `WEB_AUTH` | non défini | Identifiants Basic Auth au format `user:mot_de_passe` ; requis si `WEB_HOST` n'est pas localhost. |
 
 Fichiers et dossiers toujours ignorés lors du scan : `.!qB`, `.parts`, `.tmp`, `.DS_Store`, `Thumbs.db`, `desktop.ini`, `images`, `template`, et toute entrée cachée (nom commençant par `.`).

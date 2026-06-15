@@ -5,6 +5,7 @@ Démarrage : ./run_web.sh
 """
 
 import base64
+import hmac
 import io
 import json
 import os
@@ -17,8 +18,90 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import qbt_orphan_cleaner as _qbt
 
 WEB_PORT = int(os.environ.get("WEB_PORT", "9090"))
-WEB_HOST = os.environ.get("WEB_HOST", "0.0.0.0")
+WEB_HOST = os.environ.get("WEB_HOST", "127.0.0.1")
 __version__ = _qbt.__version__
+
+MAX_JSON_BODY = 1_000_000
+MAX_PATHS_PER_REQUEST = 1000
+
+
+class WebError(Exception):
+    """Erreur contrôlée renvoyable à l'interface web."""
+
+    def __init__(self, message, status=400):
+        super().__init__(message)
+        self.status = status
+
+
+def _is_loopback_host(host):
+    return host in {"127.0.0.1", "::1", "localhost"}
+
+
+def _storage_root_real():
+    return os.path.realpath(_qbt.STORAGE_DIR)
+
+
+def _path_is_within(path, root):
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:
+        return False
+
+
+def _safe_storage_path(path, *, allow_root=False):
+    if not isinstance(path, str) or not path.strip():
+        raise WebError("Chemin invalide")
+
+    norm = os.path.abspath(os.path.normpath(path))
+    root = _storage_root_real()
+
+    if not allow_root and norm == root:
+        raise WebError("Chemin racine non autorisé", 403)
+
+    if os.path.islink(norm):
+        parent = os.path.realpath(os.path.dirname(norm))
+        if not _path_is_within(parent, root):
+            raise WebError("Chemin non autorisé", 403)
+        return norm
+
+    real = os.path.realpath(norm)
+    if not _path_is_within(real, root):
+        raise WebError("Chemin non autorisé", 403)
+
+    return real
+
+
+def _entry_to_orphan(entry):
+    return {
+        "name": entry.name,
+        "rel_path": entry.rel_path,
+        "abs_path": entry.path,
+        "real_path": entry.real_path,
+        "is_dir": entry.is_dir,
+        "size": -1,
+        "size_human": "\u2026",
+        "category": entry.category,
+    }
+
+
+def _orphan_sort_key(orphan):
+    return (orphan["category"], not orphan["is_dir"], orphan["name"].lower())
+
+
+def _current_orphan_realpaths():
+    try:
+        client = _qbt.QBittorrentClient()
+        client.login()
+        scan = _qbt.scan_orphans(client)
+    except _qbt.QbtError as e:
+        raise WebError(str(e), 502)
+    current = {}
+    for entry in scan["orphans"]:
+        try:
+            current[_safe_storage_path(entry.path)] = _entry_to_orphan(entry)
+        except WebError:
+            continue
+    return current
 
 
 # ── Logique métier ─────────────────────────────────────────────────────────────
@@ -28,31 +111,21 @@ def run_scan():
     try:
         client = _qbt.QBittorrentClient()
         client.login()
-        known_names, category_dirs, torrents = _qbt.collect_known_files(client)
-        entries = _qbt.scan_storage(_qbt.STORAGE_DIR, category_dirs)
+        scan = _qbt.scan_orphans(client)
     except _qbt.QbtError as e:
         return {"error": str(e)}
 
-    norm_storage = os.path.normpath(_qbt.STORAGE_DIR)
-    orphans = []
-    for entry in entries:
-        if entry.name not in known_names:
-            rel = os.path.relpath(entry.path, norm_storage)
-            parts = rel.replace("\\", "/").split("/")
-            category = parts[0] if len(parts) > 1 else ""
-            orphans.append({
-                "name": entry.name,
-                "rel_path": rel,
-                "abs_path": entry.path,
-                "is_dir": entry.is_dir(),
-                "size": -1,
-                "size_human": "\u2026",
-                "category": category,
-            })
-
-    orphans.sort(key=lambda x: (x["category"], not x["is_dir"], x["name"].lower()))
+    torrents = scan["torrents"]
+    orphans = [_entry_to_orphan(entry) for entry in scan["orphans"]]
+    orphans.sort(key=_orphan_sort_key)
 
     torrent_size = sum(t.get("size", 0) for t in torrents)
+    download_speed = sum(t.get("dlspeed", 0) for t in torrents)
+    upload_speed = sum(t.get("upspeed", 0) for t in torrents)
+    active_torrents = sum(
+        1 for t in torrents
+        if t.get("dlspeed", 0) > 0 or t.get("upspeed", 0) > 0
+    )
     try:
         usage = shutil.disk_usage(_qbt.STORAGE_DIR)
         disk = {
@@ -72,6 +145,14 @@ def run_scan():
         "torrent_count": len(torrents),
         "torrent_size": torrent_size,
         "torrent_size_h": _qbt.format_size(torrent_size),
+        "active_torrent_count": active_torrents,
+        "download_speed": download_speed,
+        "download_speed_h": f"{_qbt.format_size(download_speed)}/s",
+        "upload_speed": upload_speed,
+        "upload_speed_h": f"{_qbt.format_size(upload_speed)}/s",
+        "tracker_warnings": scan["tracker_warnings"],
+        "inactive_torrents": scan["inactive_torrents"],
+        "last_activity_days": _qbt.LAST_ACTIVITY_DAYS,
         "disk": disk,
     }
 
@@ -80,8 +161,8 @@ def compute_sizes(paths):
     """Calcule les tailles pour une liste de chemins absolus."""
     result = {}
     for path in paths:
-        norm = os.path.normpath(path)
         try:
+            norm = _safe_storage_path(path)
             if os.path.isfile(norm) and not os.path.islink(norm):
                 s = os.path.getsize(norm)
             elif os.path.isdir(norm) and not os.path.islink(norm):
@@ -96,16 +177,20 @@ def compute_sizes(paths):
                 s = 0
         except OSError:
             s = 0
+        except WebError:
+            continue
         result[path] = {"size": s, "size_human": _qbt.format_size(s)}
     return result
 
 
 def browse_dir(path):
     """Liste le contenu d'un répertoire. Retourne None si chemin non autorisé."""
-    norm_storage = os.path.normpath(_qbt.STORAGE_DIR)
-    norm_path = os.path.normpath(path)
-    if norm_path != norm_storage and not norm_path.startswith(norm_storage + os.sep):
+    try:
+        norm_path = _safe_storage_path(path, allow_root=True)
+    except WebError:
         return None
+    if os.path.islink(norm_path):
+        return []
     if not os.path.isdir(norm_path):
         return []
     entries = []
@@ -123,14 +208,23 @@ def browse_dir(path):
 
 def do_delete(paths):
     """Supprime les chemins validés. Retourne {deleted, errors}."""
-    norm_storage = os.path.normpath(_qbt.STORAGE_DIR)
     deleted, errors = [], []
+    try:
+        current_orphans = _current_orphan_realpaths()
+    except WebError as e:
+        return {"deleted": deleted, "errors": [{"path": "", "error": str(e)}]}
+
     for path in paths:
-        norm_path = os.path.normpath(path)
-        if not norm_path.startswith(norm_storage + os.sep):
-            errors.append({"path": path, "error": "Chemin non autorisé"})
+        try:
+            norm_path = _safe_storage_path(path)
+        except WebError as e:
+            errors.append({"path": path, "error": str(e)})
+            continue
+        if norm_path not in current_orphans:
+            errors.append({"path": path, "error": "Chemin non orphelin"})
             continue
         try:
+            norm_path = _safe_storage_path(path)
             if os.path.isdir(norm_path) and not os.path.islink(norm_path):
                 shutil.rmtree(norm_path)
             else:
@@ -141,6 +235,28 @@ def do_delete(paths):
     return {"deleted": deleted, "errors": errors}
 
 
+def delete_torrent_with_files(torrent_hash):
+    """Supprime un torrent dans qBittorrent avec ses fichiers associés."""
+    if not isinstance(torrent_hash, str) or not torrent_hash.strip():
+        return {"ok": False, "error": "Hash torrent manquant"}
+    torrent_hash = torrent_hash.strip()
+    try:
+        client = _qbt.QBittorrentClient()
+        client.login()
+        torrents = client.get_torrents()
+        inactive_hashes = {
+            t.get("hash")
+            for t in _qbt.check_inactive_torrents(torrents)
+            if t.get("hash")
+        }
+        if torrent_hash not in inactive_hashes:
+            return {"ok": False, "error": "Torrent non inactif ou introuvable"}
+        client.delete_torrent(torrent_hash, delete_files=True)
+        return {"ok": True, "hash": torrent_hash}
+    except _qbt.QbtError as e:
+        return {"ok": False, "error": str(e)}
+
+
 def get_config():
     return {
         "QB_HOST": _qbt.QB_HOST,
@@ -148,13 +264,66 @@ def get_config():
         "QB_USER": _qbt.QB_USER,
         "QB_PASS": _qbt.QB_PASS,
         "STORAGE_DIR": _qbt.STORAGE_DIR,
+        "LAST_ACTIVITY_DAYS": str(_qbt.LAST_ACTIVITY_DAYS),
         "WEB_PORT": str(WEB_PORT),
     }
 
 
+def _validate_port(name, value):
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        raise WebError(f"{name} doit être un entier")
+    if not 1 <= port <= 65535:
+        raise WebError(f"{name} doit être entre 1 et 65535")
+    return str(port)
+
+
+def _validate_config(config):
+    allowed = {"QB_HOST", "QB_PORT", "QB_USER", "QB_PASS", "STORAGE_DIR", "LAST_ACTIVITY_DAYS", "WEB_PORT"}
+    filtered = {}
+    for key, value in config.items():
+        if key not in allowed:
+            continue
+        value = str(value).strip()
+        if not value:
+            continue
+        if "\n" in value or "\r" in value:
+            raise WebError(f"{key} contient un retour ligne interdit")
+        filtered[key] = value
+
+    if "QB_HOST" in filtered:
+        parsed = urllib.parse.urlparse(filtered["QB_HOST"])
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise WebError("QB_HOST doit être une URL http(s) valide")
+        filtered["QB_HOST"] = filtered["QB_HOST"].rstrip("/")
+
+    if "QB_PORT" in filtered:
+        filtered["QB_PORT"] = _validate_port("QB_PORT", filtered["QB_PORT"])
+
+    if "WEB_PORT" in filtered:
+        filtered["WEB_PORT"] = _validate_port("WEB_PORT", filtered["WEB_PORT"])
+
+    if "LAST_ACTIVITY_DAYS" in filtered:
+        try:
+            days = int(filtered["LAST_ACTIVITY_DAYS"])
+        except ValueError:
+            raise WebError("LAST_ACTIVITY_DAYS doit être un entier")
+        if days < 0:
+            raise WebError("LAST_ACTIVITY_DAYS doit être positif ou nul")
+        filtered["LAST_ACTIVITY_DAYS"] = str(days)
+
+    if "STORAGE_DIR" in filtered:
+        storage = os.path.abspath(os.path.expanduser(filtered["STORAGE_DIR"]))
+        if not os.path.isdir(storage):
+            raise WebError("STORAGE_DIR doit être un répertoire existant")
+        filtered["STORAGE_DIR"] = storage
+
+    return filtered
+
+
 def apply_config(config):
-    allowed = {"QB_HOST", "QB_PORT", "QB_USER", "QB_PASS", "STORAGE_DIR", "WEB_PORT"}
-    filtered = {k: str(v).strip() for k, v in config.items() if k in allowed and str(v).strip()}
+    filtered = _validate_config(config)
     _qbt.save_env(filtered)
     _qbt.reload_config()
 
@@ -212,39 +381,73 @@ HTML = """<!DOCTYPE html>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
-  --bg:#07070d;
-  --surface:#0d0d16;
-  --card:#12121c;
-  --card2:#161622;
-  --border:#1c1c2a;
-  --border-hi:#272738;
+  --bg:#090b10;
+  --surface:#10131a;
+  --card:#151a24;
+  --card2:#1b2230;
+  --border:#252c3a;
+  --border-hi:#374151;
   --primary:#6366f1;
-  --primary-dim:#6366f114;
+  --primary-dim:#6366f11a;
   --primary-glow:#6366f133;
   --danger:#ef4444;
   --success:#10b981;
   --warn:#f59e0b;
-  --text:#eef0f8;
-  --text-2:#7880a0;
-  --text-3:#383e52;
+  --text:#f3f4f6;
+  --text-2:#9ca3af;
+  --text-3:#647084;
+  --row-hover:#1a2130;
+  --row-selected:#202548;
+  --warning-bg:#18130b;
+  --warning-card:#21180b;
+  --warning-border:#5a3c0a;
+  --warning-text:#f59e0b;
+  --warning-soft:#fbbf24;
+  --shadow:0 18px 45px rgba(0,0,0,.28);
   --r:8px;
   --r2:12px;
 }
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;font-size:14px;line-height:1.5}
+body[data-theme="light"]{
+  --bg:#f4f6fb;
+  --surface:#ffffff;
+  --card:#ffffff;
+  --card2:#f1f5f9;
+  --border:#d9e0ea;
+  --border-hi:#b8c3d4;
+  --primary:#4f46e5;
+  --primary-dim:#4f46e512;
+  --primary-glow:#4f46e526;
+  --danger:#dc2626;
+  --success:#059669;
+  --warn:#d97706;
+  --text:#111827;
+  --text-2:#475569;
+  --text-3:#7c8798;
+  --row-hover:#f1f5f9;
+  --row-selected:#eef2ff;
+  --warning-bg:#fff7ed;
+  --warning-card:#ffffff;
+  --warning-border:#fed7aa;
+  --warning-text:#c2410c;
+  --warning-soft:#ea580c;
+  --shadow:0 18px 40px rgba(15,23,42,.10);
+}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;font-size:14px;line-height:1.5;transition:background .2s,color .2s}
 
 /* ── Header ── */
 header{
   display:flex;align-items:center;justify-content:space-between;
-  padding:0 28px;height:56px;
+  padding:0 28px;height:64px;
   background:var(--surface);
   border-bottom:1px solid var(--border);
   position:sticky;top:0;z-index:100;
+  box-shadow:0 1px 0 rgba(0,0,0,.04);
 }
 .hd-brand{display:flex;align-items:center;gap:12px}
 .hd-logo{font-size:22px;line-height:1;filter:drop-shadow(0 0 8px #6366f155)}
 .hd-title{font-size:15px;font-weight:700;letter-spacing:-.01em}
 .ver-pill{
-  background:var(--primary-dim);border:1px solid #2d2d6a;
+  background:var(--primary-dim);border:1px solid var(--border-hi);
   color:var(--primary);border-radius:999px;
   padding:2px 10px;font-size:11px;font-weight:600;letter-spacing:.02em;
 }
@@ -277,26 +480,29 @@ header{
 
 /* ── Dashboard ── */
 .dash{
-  max-width:920px;margin:0 auto;width:100%;
-  display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;
-  padding:20px 28px 0;
+  max-width:1180px;margin:0 auto;width:100%;
+  display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;
+  padding:22px 28px 0;
 }
 .dash-card{
   background:var(--card);border:1px solid var(--border);
-  border-radius:var(--r2);padding:16px 20px;
+  border-radius:var(--r2);padding:18px 20px;
   display:flex;flex-direction:column;gap:12px;
-  transition:border-color .2s;
+  transition:border-color .2s,box-shadow .2s,transform .2s;
+  box-shadow:var(--shadow);
 }
-.dash-card:hover{border-color:var(--border-hi)}
+.dash-card:hover{border-color:var(--border-hi);transform:translateY(-1px)}
 .dc-header{display:flex;align-items:center;justify-content:space-between}
 .dc-icon{
   width:34px;height:34px;border-radius:9px;
   display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0;
 }
-.dc-icon.blue{background:#1a1a3a;box-shadow:0 0 0 1px #3a3a7a}
-.dc-icon.green{background:#0d2218;box-shadow:0 0 0 1px #1a4030}
-.dc-icon.red{background:#2a0d0d;box-shadow:0 0 0 1px #4a1a1a}
-.dc-icon.amber{background:#1f1a08;box-shadow:0 0 0 1px #3a300a}
+.dc-icon.blue{background:var(--primary-dim);box-shadow:0 0 0 1px var(--border-hi);color:var(--primary)}
+.dc-icon.green{background:#10b98118;box-shadow:0 0 0 1px #10b98140;color:var(--success)}
+.dc-icon.red{background:#ef444418;box-shadow:0 0 0 1px #ef444440;color:var(--danger)}
+.dc-icon.amber{background:#f59e0b18;box-shadow:0 0 0 1px #f59e0b40;color:var(--warn)}
+.dc-icon.purple{background:#8b5cf618;box-shadow:0 0 0 1px #8b5cf640;color:#a78bfa}
+.dc-icon.cyan{background:#06b6d418;box-shadow:0 0 0 1px #06b6d440;color:#22d3ee}
 .dc-label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.09em;color:var(--text-3)}
 .dc-body{display:flex;flex-direction:column;gap:6px}
 .dc-stat{display:flex;align-items:baseline;gap:6px}
@@ -325,7 +531,7 @@ header{
 .orphan-actions{display:flex;align-items:center;gap:8px;flex-shrink:0}
 
 /* ── Main ── */
-main{max-width:920px;margin:0 auto;padding:16px 28px 48px;width:100%}
+main{max-width:1180px;margin:0 auto;padding:16px 28px 48px;width:100%}
 
 /* States */
 .state{
@@ -340,10 +546,36 @@ main{max-width:920px;margin:0 auto;padding:16px 28px 48px;width:100%}
 .state p{font-size:13px;max-width:260px}
 @keyframes spin{to{transform:rotate(360deg)}}
 
+/* Scan panels */
+.scan-warnings{
+  background:var(--warning-bg);border:1px solid var(--warning-border);color:var(--warning-text);
+  border-radius:var(--r2);padding:14px;margin-bottom:14px;box-shadow:var(--shadow);
+}
+.scan-warnings.inactive{background:var(--warning-bg);border-color:var(--warning-border);color:var(--warning-text)}
+.tw-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}
+.tw-title{font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.08em;color:var(--warning-soft)}
+.tw-count{font-size:12px;color:var(--warning-text)}
+.tw-list{display:grid;gap:8px}
+.tw-item{background:var(--warning-card);border:1px solid var(--warning-border);border-radius:9px;padding:10px 12px}
+.tw-row{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.tw-main{min-width:0;flex:1}
+.tw-name{font-size:13px;font-weight:700;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tw-reason{font-size:11px;color:var(--warning-text);margin-top:2px}
+.tw-size{display:grid;gap:1px;text-align:right;color:var(--text);white-space:nowrap}
+.tw-size-label{font-size:9px;font-weight:800;color:var(--text-3);text-transform:uppercase;letter-spacing:.07em}
+.tw-size-value{font-size:13px;font-weight:800;color:var(--warning-soft)}
+.tw-actions{display:flex;align-items:center;gap:8px;flex-shrink:0}
+.tw-trackers{margin-top:6px;display:grid;gap:3px}
+.tw-tracker{font-size:11px;color:var(--warning-text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.btn-torrent-del{padding:5px 9px;font-size:11px}
+.scan-warnings.inactive .tw-count{color:var(--warning-text)}
+.scan-warnings.inactive .tw-name{color:var(--text)}
+.scan-warnings.inactive .tw-reason{color:var(--warning-text)}
+
 /* ── Table ── */
 .table-wrap{
   background:var(--card);border:1px solid var(--border);
-  border-radius:var(--r2);overflow:hidden;
+  border-radius:var(--r2);overflow:hidden;box-shadow:var(--shadow);
 }
 .table-bar{
   display:flex;align-items:center;justify-content:space-between;
@@ -376,9 +608,9 @@ input[type=checkbox]{width:15px;height:15px;accent-color:var(--primary);cursor:p
 /* Row */
 .row{display:flex;align-items:center;border-bottom:1px solid var(--border);transition:background .1s}
 .row:last-child{border-bottom:none}
-.row:hover{background:#0f0f1e}
-.row.sel{background:#0e0e2a}
-.row.sel:hover{background:#12123a}
+.row:hover{background:var(--row-hover)}
+.row.sel{background:var(--row-selected)}
+.row.sel:hover{background:var(--row-selected)}
 .c-cb{padding:12px 6px 12px 14px;flex-shrink:0}
 .c-ic{padding:12px 6px;font-size:15px;flex-shrink:0;user-select:none}
 .c-nm{flex:1;padding:10px 6px;min-width:0;cursor:pointer}
@@ -397,7 +629,7 @@ input[type=checkbox]{width:15px;height:15px;accent-color:var(--primary);cursor:p
 .btn-exp:disabled{opacity:.3;cursor:default}
 
 /* Browse panel */
-.browse-panel{background:#080812;border-bottom:1px dashed var(--border)}
+.browse-panel{background:var(--bg);border-bottom:1px dashed var(--border)}
 .bp-item{display:flex;align-items:center;gap:8px;padding:5px 14px 5px 50px;font-size:12px;color:var(--text-3);border-bottom:1px solid var(--bg)}
 .bp-item:last-child{border-bottom:none}
 .bp-nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
@@ -452,14 +684,28 @@ input[type=checkbox]{width:15px;height:15px;accent-color:var(--primary);cursor:p
 .toast{position:fixed;bottom:22px;right:22px;padding:12px 18px;border-radius:var(--r);font-size:13px;font-weight:500;z-index:300;max-width:320px;animation:fadeIn .2s ease;pointer-events:none}
 .toast.ok{background:#091811;border:1px solid var(--success);color:#6ee7b7}
 .toast.err{background:#190909;border:1px solid var(--danger);color:#fca5a5}
+body[data-theme="light"] .toast.ok{background:#ecfdf5;color:#047857}
+body[data-theme="light"] .toast.err{background:#fef2f2;color:#b91c1c}
 @keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
 
 .hidden{display:none!important}
+@media(max-width:980px){
+  .dash{grid-template-columns:1fr 1fr}
+}
 @media(max-width:680px){
   header,.dash,main{padding-left:14px;padding-right:14px}
+  header{height:auto;min-height:64px;gap:10px;flex-wrap:wrap;padding-top:10px;padding-bottom:10px}
+  .hd-right{width:100%;justify-content:flex-start;overflow-x:auto;padding-bottom:2px}
   .dash{grid-template-columns:1fr 1fr}
   .dash-card.orphan-card{grid-column:1/-1;flex-direction:column;align-items:flex-start;gap:14px}
-  header{padding-left:14px;padding-right:14px}
+  .tw-row{align-items:flex-start;flex-direction:column}
+  .tw-actions{width:100%;justify-content:space-between}
+  .tw-size{text-align:left}
+  .table-foot .kbd{display:none}
+}
+@media(max-width:460px){
+  .dash{grid-template-columns:1fr}
+  .dc-value{font-size:24px}
 }
 </style>
 </head>
@@ -476,6 +722,7 @@ input[type=checkbox]{width:15px;height:15px;accent-color:var(--primary);cursor:p
       <span class="conn-dot" id="dot"></span>
       <span id="status-txt">–</span>
     </div>
+    <button class="btn btn-ghost" id="btn-theme" title="Toggle theme">☾ Dark</button>
     <button class="btn btn-ghost" id="btn-cfg">⚙ Config</button>
     <button class="btn btn-primary" id="btn-scan">↻ Scan</button>
   </div>
@@ -496,6 +743,36 @@ input[type=checkbox]{width:15px;height:15px;accent-color:var(--primary);cursor:p
         <div class="dc-unit">torrents</div>
       </div>
       <div class="dc-sub" id="qbt-size">–</div>
+    </div>
+  </div>
+
+  <!-- Active torrents card -->
+  <div class="dash-card">
+    <div class="dc-header">
+      <div class="dc-label">Active</div>
+      <div class="dc-icon purple">▶</div>
+    </div>
+    <div class="dc-body">
+      <div class="dc-stat">
+        <div class="dc-value" id="active-count">–</div>
+        <div class="dc-unit">active</div>
+      </div>
+      <div class="dc-sub" id="active-sub">–</div>
+    </div>
+  </div>
+
+  <!-- Transfer card -->
+  <div class="dash-card">
+    <div class="dc-header">
+      <div class="dc-label">Transfer</div>
+      <div class="dc-icon cyan">↕</div>
+    </div>
+    <div class="dc-body">
+      <div class="dc-stat">
+        <div class="dc-value" id="dl-speed">–</div>
+        <div class="dc-unit">down</div>
+      </div>
+      <div class="dc-sub" id="up-speed">–</div>
     </div>
   </div>
 
@@ -542,6 +819,20 @@ input[type=checkbox]{width:15px;height:15px;accent-color:var(--primary);cursor:p
 </div>
 
 <main>
+  <div id="tracker-warnings" class="scan-warnings hidden">
+    <div class="tw-head">
+      <div class="tw-title">Tracker check</div>
+      <div class="tw-count" id="tw-count"></div>
+    </div>
+    <div class="tw-list" id="tw-list"></div>
+  </div>
+  <div id="activity-warnings" class="scan-warnings inactive hidden">
+    <div class="tw-head">
+      <div class="tw-title">Last activity</div>
+      <div class="tw-count" id="aw-count"></div>
+    </div>
+    <div class="tw-list" id="aw-list"></div>
+  </div>
   <!-- Loading -->
   <div id="v-loading" class="state">
     <div class="state-ic spin"></div>
@@ -609,6 +900,7 @@ input[type=checkbox]{width:15px;height:15px;accent-color:var(--primary);cursor:p
       <div class="cfg-field"><label>Username</label><input id="cfg-QB_USER" type="text" placeholder="admin"></div>
       <div class="cfg-field"><label>Password</label><input id="cfg-QB_PASS" type="password" placeholder="••••••••"></div>
       <div class="cfg-field"><label>Storage directory</label><input id="cfg-STORAGE_DIR" type="text" placeholder="/mnt/downloads"></div>
+      <div class="cfg-field"><label>Inactive after days</label><input id="cfg-LAST_ACTIVITY_DAYS" type="number" min="0" placeholder="30"></div>
       <div class="cfg-field"><label>Web port</label><input id="cfg-WEB_PORT" type="number" placeholder="9090"></div>
     </div>
     <p class="cfg-note">ℹ Changing the web port requires a server restart.</p>
@@ -629,6 +921,16 @@ const rowMap = new Map();
 const szMap  = new Map();
 const browsePanels = new Map();
 let browseOpen = new Set();
+
+function applyTheme(theme) {
+  const next = theme === 'light' ? 'light' : 'dark';
+  document.body.dataset.theme = next;
+  localStorage.setItem('qbt-theme', next);
+  const btn = $('btn-theme');
+  if (btn) btn.textContent = next === 'light' ? '☀ Light' : '☾ Dark';
+}
+
+applyTheme(localStorage.getItem('qbt-theme') || 'dark');
 
 function fmtSize(b) {
   if (b < 0) return '…';
@@ -657,6 +959,11 @@ function updateDash(data) {
   // qBt
   $('qbt-count').textContent = data.torrent_count >= 0 ? data.torrent_count : '–';
   $('qbt-size').textContent = data.torrent_count >= 0 ? data.torrent_size_h + ' managed' : 'unavailable';
+  // activity
+  $('active-count').textContent = data.active_torrent_count >= 0 ? data.active_torrent_count : '–';
+  $('active-sub').textContent = data.torrent_count >= 0 ? 'of ' + data.torrent_count + ' torrents' : 'unavailable';
+  $('dl-speed').textContent = data.download_speed_h || '–';
+  $('up-speed').textContent = data.upload_speed_h ? data.upload_speed_h + ' up' : '–';
   // disk
   const d = data.disk;
   if (d) {
@@ -672,6 +979,150 @@ function updateDash(data) {
   $('ostat-size').textContent = '…';
   $('ostat-sel').textContent = 0;
   $('dash').classList.remove('hidden');
+}
+
+function renderTrackerWarnings(warnings) {
+  const box = $('tracker-warnings');
+  const list = $('tw-list');
+  warnings = Array.isArray(warnings) ? warnings : [];
+  list.innerHTML = '';
+
+  if (warnings.length === 0) {
+    box.classList.add('hidden');
+    return;
+  }
+
+  $('tw-count').textContent = warnings.length + ' torrent(s) without Working tracker';
+  warnings.forEach(w => {
+    const item = document.createElement('div');
+    item.className = 'tw-item';
+
+    const name = document.createElement('div');
+    name.className = 'tw-name';
+    name.title = w.hash || '';
+    name.textContent = w.name || '(unnamed torrent)';
+    item.appendChild(name);
+
+    const reason = document.createElement('div');
+    reason.className = 'tw-reason';
+    reason.textContent = w.reason || 'No Working tracker';
+    item.appendChild(reason);
+
+    const trackers = Array.isArray(w.trackers) ? w.trackers.slice(0, 4) : [];
+    if (trackers.length > 0) {
+      const trackerList = document.createElement('div');
+      trackerList.className = 'tw-trackers';
+      trackers.forEach(t => {
+        const row = document.createElement('div');
+        row.className = 'tw-tracker';
+        const msg = t.message ? ' - ' + t.message : '';
+        row.textContent = (t.status || 'Unknown') + ': ' + (t.url || '(no URL)') + msg;
+        trackerList.appendChild(row);
+      });
+      item.appendChild(trackerList);
+    }
+
+    list.appendChild(item);
+  });
+  box.classList.remove('hidden');
+}
+
+function renderActivityWarnings(inactive, thresholdDays) {
+  const box = $('activity-warnings');
+  const list = $('aw-list');
+  inactive = Array.isArray(inactive) ? inactive : [];
+  list.innerHTML = '';
+
+  if (thresholdDays <= 0 || inactive.length === 0) {
+    box.classList.add('hidden');
+    return;
+  }
+
+  $('aw-count').textContent = inactive.length + ' torrent(s) inactive for over ' + thresholdDays + ' days';
+  inactive.forEach(t => {
+    const item = document.createElement('div');
+    item.className = 'tw-item';
+    item.dataset.hash = t.hash || '';
+
+    const row = document.createElement('div');
+    row.className = 'tw-row';
+    const main = document.createElement('div');
+    main.className = 'tw-main';
+    const name = document.createElement('div');
+    name.className = 'tw-name';
+    name.title = t.hash || '';
+    name.textContent = t.name || '(unnamed torrent)';
+    main.appendChild(name);
+
+    const reason = document.createElement('div');
+    reason.className = 'tw-reason';
+    const age = t.inactive_days === null || t.inactive_days === undefined
+      ? 'never active'
+      : t.inactive_days + ' days inactive';
+    reason.textContent = 'Last activity: ' + (t.last_activity_h || 'never') + ' - ' + age;
+    main.appendChild(reason);
+
+    const actions = document.createElement('div');
+    actions.className = 'tw-actions';
+    const size = document.createElement('div');
+    size.className = 'tw-size';
+    size.title = 'Recoverable space';
+    const sizeLabel = document.createElement('div');
+    sizeLabel.className = 'tw-size-label';
+    sizeLabel.textContent = 'Recoverable';
+    const sizeValue = document.createElement('div');
+    sizeValue.className = 'tw-size-value';
+    sizeValue.textContent = t.size_h || fmtSize(t.size || 0);
+    size.appendChild(sizeLabel);
+    size.appendChild(sizeValue);
+    actions.appendChild(size);
+
+    const del = document.createElement('button');
+    del.className = 'btn btn-danger btn-torrent-del';
+    del.type = 'button';
+    del.textContent = 'Supprimer';
+    del.disabled = !t.hash;
+    del.title = 'Supprimer le torrent et ses fichiers';
+    del.addEventListener('click', () => deleteInactiveTorrent(t, del));
+    actions.appendChild(del);
+
+    row.appendChild(main);
+    row.appendChild(actions);
+    item.appendChild(row);
+
+    list.appendChild(item);
+  });
+  box.classList.remove('hidden');
+}
+
+async function deleteInactiveTorrent(torrent, btn) {
+  const name = torrent.name || '(unnamed torrent)';
+  const size = torrent.size_h || fmtSize(torrent.size || 0);
+  if (!confirm('Supprimer le torrent "' + name + '" et ses fichiers associes ?\\nEspace recuperable: ' + size)) {
+    return;
+  }
+  btn.disabled = true;
+  btn.textContent = '...';
+  try {
+    const r = await fetch('/api/delete-torrent', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({hash: torrent.hash})
+    });
+    const data = await r.json();
+    if (!data.ok) {
+      toast(data.error || 'Torrent delete failed', 'err');
+      btn.disabled = false;
+      btn.textContent = 'Supprimer';
+      return;
+    }
+    toast('Torrent supprime: ' + name, 'ok');
+    doScan();
+  } catch(e) {
+    toast('Network error: ' + e.message, 'err');
+    btn.disabled = false;
+    btn.textContent = 'Supprimer';
+  }
 }
 
 function updateKpi() {
@@ -745,6 +1196,8 @@ function renderOrphans(data) {
   $('ostat-count').textContent = orphans.length;
   $('ostat-size').textContent = '…';
   updateDash(data);
+  renderTrackerWarnings(data.tracker_warnings);
+  renderActivityWarnings(data.inactive_torrents, data.last_activity_days);
 
   const list = $('orphan-list');
   list.innerHTML = '';
@@ -871,6 +1324,8 @@ async function fetchSizes() {
 // ── Scan ───────────────────────────────────────────────────
 async function doScan() {
   show('v-loading');
+  $('tracker-warnings').classList.add('hidden');
+  $('activity-warnings').classList.add('hidden');
   $('btn-scan').disabled = true;
   try {
     const r = await fetch('/api/scan');
@@ -1014,7 +1469,7 @@ async function openConfig() {
   try {
     const r = await fetch('/api/config');
     const cfg = await r.json();
-    ['QB_HOST','QB_PORT','QB_USER','QB_PASS','STORAGE_DIR','WEB_PORT'].forEach(k => {
+    ['QB_HOST','QB_PORT','QB_USER','QB_PASS','STORAGE_DIR','LAST_ACTIVITY_DAYS','WEB_PORT'].forEach(k => {
       const el = $('cfg-' + k);
       if (el) el.value = cfg[k] || '';
     });
@@ -1024,7 +1479,7 @@ async function openConfig() {
 
 async function saveConfig() {
   const config = {};
-  ['QB_HOST','QB_PORT','QB_USER','QB_PASS','STORAGE_DIR','WEB_PORT'].forEach(k => {
+  ['QB_HOST','QB_PORT','QB_USER','QB_PASS','STORAGE_DIR','LAST_ACTIVITY_DAYS','WEB_PORT'].forEach(k => {
     const el = $('cfg-' + k);
     if (el && el.value.trim()) config[k] = el.value.trim();
   });
@@ -1048,6 +1503,9 @@ async function saveConfig() {
 // ── Events ──────────────────────────────────────────────────
 $('btn-scan').addEventListener('click', doScan);
 $('btn-cfg').addEventListener('click', openConfig);
+$('btn-theme').addEventListener('click', () => {
+  applyTheme(document.body.dataset.theme === 'light' ? 'dark' : 'light');
+});
 $('sel-all').addEventListener('change', e => {
   const visible = orphans.filter(o => !rowMap.get(o.abs_path)?.classList.contains('hidden'));
   if (e.target.checked) visible.forEach(o => selected.add(o.abs_path));
@@ -1120,7 +1578,7 @@ class Handler(BaseHTTPRequestHandler):
         if auth_header.startswith("Basic "):
             try:
                 decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
-                if decoded == _WEB_AUTH:
+                if hmac.compare_digest(decoded, _WEB_AUTH):
                     return True
             except Exception:
                 pass
@@ -1177,39 +1635,69 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._check_auth():
             return
-        length = int(self.headers.get("Content-Length", 0))
         try:
-            body = json.loads(self.rfile.read(length))
-        except (json.JSONDecodeError, ValueError):
+            body = self._read_json_body()
+        except WebError as e:
+            self._json({"error": str(e)}, e.status)
+            return
+        except (json.JSONDecodeError, UnicodeDecodeError):
             self._json({"error": "JSON invalide"}, 400)
             return
 
-        if self.path == "/api/delete":
+        if not isinstance(body, dict):
+            self._json({"error": "Corps JSON invalide"}, 400)
+            return
+
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+
+        if path == "/api/delete":
             paths = body.get("paths", [])
             if not isinstance(paths, list):
                 self._json({"error": "paths doit être une liste"}, 400)
+                return
+            if len(paths) > MAX_PATHS_PER_REQUEST:
+                self._json({"error": "Trop de chemins demandés"}, 413)
                 return
             self._json(do_delete(paths))
 
-        elif self.path == "/api/sizes":
+        elif path == "/api/delete-torrent":
+            torrent_hash = body.get("hash", "")
+            result = delete_torrent_with_files(torrent_hash)
+            self._json(result, 200 if result.get("ok") else 400)
+
+        elif path == "/api/sizes":
             paths = body.get("paths", [])
             if not isinstance(paths, list):
                 self._json({"error": "paths doit être une liste"}, 400)
                 return
+            if len(paths) > MAX_PATHS_PER_REQUEST:
+                self._json({"error": "Trop de chemins demandés"}, 413)
+                return
             self._json({"sizes": compute_sizes(paths)})
 
-        elif self.path == "/api/config":
-            if not isinstance(body, dict):
-                self._json({"error": "Corps JSON invalide"}, 400)
-                return
+        elif path == "/api/config":
             try:
                 apply_config(body)
                 self._json({"ok": True})
+            except WebError as e:
+                self._json({"error": str(e)}, e.status)
             except Exception as e:
                 self._json({"error": str(e)}, 500)
 
         else:
             self._json({"error": "Not found"}, 404)
+
+    def _read_json_body(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            raise WebError("Content-Length invalide")
+        if length <= 0:
+            raise WebError("Corps JSON manquant")
+        if length > MAX_JSON_BODY:
+            raise WebError("Corps JSON trop volumineux", 413)
+        return json.loads(self.rfile.read(length).decode("utf-8"))
 
     def _send(self, status, ctype, body: bytes):
         self.send_response(status)
@@ -1227,6 +1715,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    if not _is_loopback_host(WEB_HOST) and not _WEB_AUTH:
+        raise SystemExit("WEB_AUTH est requis lorsque WEB_HOST n'est pas localhost")
     server = ThreadingHTTPServer((WEB_HOST, WEB_PORT), Handler)
     local_url = f"http://localhost:{WEB_PORT}"
     print("=" * 50)

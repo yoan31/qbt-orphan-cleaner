@@ -183,18 +183,15 @@ def tracker_is_working(tracker):
     return False
 
 
-def check_torrent_trackers(client, torrents, hashes=None):
+def check_torrent_trackers(client, torrents):
     """
     Return the torrents that have no tracker with the Working status.
 
     Each item contains the torrent name, its hash and the known trackers, so it
-    can be reported from the CLI or the web interface. When ``hashes`` is given,
-    only those torrents are checked, which avoids a per-torrent HTTP request for
-    the whole library when only a few hashes are relevant.
+    can be reported from the CLI or the web interface. Callers that only care
+    about a few torrents should filter ``torrents`` beforehand to avoid a
+    per-torrent HTTP request for the whole library.
     """
-    if hashes is not None:
-        wanted = {h for h in hashes if h}
-        torrents = [t for t in torrents if t.get("hash") in wanted]
     warnings = []
     for torrent in torrents:
         torrent_hash = torrent.get("hash", "")

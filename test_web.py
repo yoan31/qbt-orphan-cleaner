@@ -287,6 +287,25 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(result["errors"][0]["error"], "Missing torrent hash")
         self.assertEqual(calls, [("abc", True)])
 
+    def test_delete_torrents_batch_skips_connection_when_no_valid_hash(self):
+        connected = []
+
+        class FakeClient:
+            def login(self):
+                connected.append(True)
+
+            def get_torrents(self):
+                return []
+
+        web._qbt.QBittorrentClient = FakeClient
+
+        result = web.delete_torrents_with_files(["", "   "])
+
+        self.assertEqual(result["deleted"], [])
+        self.assertEqual(len(result["errors"]), 2)
+        self.assertTrue(all(e["error"] == "Missing torrent hash" for e in result["errors"]))
+        self.assertEqual(connected, [])
+
     def test_delete_torrent_with_files_requires_hash(self):
         result = web.delete_torrent_with_files("")
 

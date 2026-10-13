@@ -253,23 +253,13 @@ def _delete_torrent_once(torrent_hash):
         client = _qbt.QBittorrentClient()
         client.login()
         torrents = client.get_torrents()
-        inactive_hashes = {
-            t.get("hash")
-            for t in _qbt.check_inactive_torrents(torrents)
-            if t.get("hash")
-        }
-        if torrent_hash not in inactive_hashes:
-            tracker_warning_hashes = {
-                t.get("hash")
-                for t in _qbt.check_torrent_trackers(client, torrents, hashes=[torrent_hash])
-                if t.get("hash")
+        eligible = _eligible_torrent_hashes(client, torrents, hashes=[torrent_hash])
+        if torrent_hash not in eligible:
+            return {
+                "ok": False,
+                "hash": torrent_hash,
+                "error": "Torrent is neither inactive nor without a Working tracker, or not found",
             }
-            if torrent_hash not in tracker_warning_hashes:
-                return {
-                    "ok": False,
-                    "hash": torrent_hash,
-                    "error": "Torrent is neither inactive nor without a Working tracker, or not found",
-                }
         client.delete_torrent(torrent_hash, delete_files=True)
         return {"ok": True, "hash": torrent_hash}
     except _qbt.QbtError as e:
@@ -290,9 +280,10 @@ def _eligible_torrent_hashes(client, torrents, hashes=None):
         for t in _qbt.check_inactive_torrents(torrents)
         if t.get("hash")
     }
+    remaining = [t for t in torrents if t.get("hash") not in inactive_hashes]
     tracker_warning_hashes = {
         t.get("hash")
-        for t in _qbt.check_torrent_trackers(client, torrents)
+        for t in _qbt.check_torrent_trackers(client, remaining)
         if t.get("hash")
     }
     return inactive_hashes | tracker_warning_hashes
@@ -316,13 +307,17 @@ def delete_torrents_with_files(hashes):
             continue
         valid_hashes.append(torrent_hash.strip())
 
+    if not valid_hashes:
+        return {"deleted": deleted, "errors": errors}
+
     try:
         client = _qbt.QBittorrentClient()
         client.login()
         torrents = client.get_torrents()
         eligible = _eligible_torrent_hashes(client, torrents, hashes=valid_hashes)
     except _qbt.QbtError as e:
-        return {"deleted": deleted, "errors": [{"hash": None, "error": str(e)}]}
+        errors.append({"hash": None, "error": str(e)})
+        return {"deleted": deleted, "errors": errors}
 
     for torrent_hash in valid_hashes:
         if torrent_hash not in eligible:
@@ -1039,6 +1034,12 @@ const GROUP_IDS = {
   tracker:  { list: 'tw-list', selAll: 'tw-sel-all', selCount: 'tw-selcount', delSel: 'tw-del-sel', delAll: 'tw-del-all' },
   activity: { list: 'aw-list', selAll: 'aw-sel-all', selCount: 'aw-selcount', delSel: 'aw-del-sel', delAll: 'aw-del-all' }
 };
+const GROUP_SCAN_KEY = { tracker: 'tracker_warnings', activity: 'inactive_torrents' };
+
+function groupItemsFor(kind) {
+  const arr = lastScan && Array.isArray(lastScan[GROUP_SCAN_KEY[kind]]) ? lastScan[GROUP_SCAN_KEY[kind]] : [];
+  return arr;
+}
 
 function applyTheme(theme) {
   const next = theme === 'light' ? 'light' : 'dark';
@@ -1329,23 +1330,21 @@ function setGroupAll(kind, checked) {
   updateGroupSel(kind);
 }
 
-function groupRecoverableSize(kind) {
-  const names = { tracker: 'tracker_warnings', activity: 'inactive_torrents' };
-  const arr = (lastScan && Array.isArray(lastScan[names[kind]])) ? lastScan[names[kind]] : [];
-  const sel = groupSel[kind];
-  return arr.filter(t => sel.has(t.hash)).reduce((s, t) => s + Math.max(0, t.size || 0), 0);
+function groupRecoverableSize(kind, hashes) {
+  const wanted = new Set(hashes);
+  return groupItemsFor(kind)
+    .filter(t => wanted.has(t.hash))
+    .reduce((s, t) => s + Math.max(0, t.size || 0), 0);
 }
 
 function groupNameFor(kind, hash) {
-  const names = { tracker: 'tracker_warnings', activity: 'inactive_torrents' };
-  const arr = (lastScan && Array.isArray(lastScan[names[kind]])) ? lastScan[names[kind]] : [];
-  const found = arr.find(t => t.hash === hash);
+  const found = groupItemsFor(kind).find(t => t.hash === hash);
   return (found && found.name) ? found.name : hash;
 }
 
 async function deleteTorrentsBatch(kind, hashes, buttons) {
   if (hashes.length === 0) return;
-  const size = groupRecoverableSize(kind);
+  const size = groupRecoverableSize(kind, hashes);
   const sizeLine = size > 0 ? '\\nRecoverable space: ' + fmtSize(size) : '';
   const preview = hashes.slice(0, 5).map(h => '  • ' + groupNameFor(kind, h)).join('\\n');
   const more = hashes.length > 5 ? '\\n  … and ' + (hashes.length - 5) + ' more' : '';

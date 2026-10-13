@@ -66,6 +66,12 @@ The web interface lets you:
 - 🗑️ Delete with confirmation modal
 - ⚙️ Edit the configuration without touching `.env` directly
 
+The **Tracker check** and **Last activity** sections also support per-group
+selection: tick individual torrents, use the group's *select all* checkbox, then
+**Delete selected** — or **Delete all** to remove every listed torrent at once.
+Bulk deletion confirms with the count, the recoverable size (when known) and a
+short preview of the affected torrent names.
+
 ## 🔍 How it works
 
 1. 🔐 **Login** — authenticates against qBittorrent WebUI
@@ -162,6 +168,12 @@ L'interface web permet de :
 - ☑️ Sélectionner/désélectionner des éléments individuellement ou tous à la fois
 - 🗑️ Supprimer avec une fenêtre de confirmation
 - ⚙️ Modifier la configuration sans toucher au fichier `.env`
+
+Les sections **Tracker check** et **Last activity** gèrent aussi une sélection
+par groupe : cochez des torrents, utilisez la case *tout sélectionner* du groupe,
+puis **Delete selected** — ou **Delete all** pour supprimer d'un coup tous les
+torrents listés. La suppression groupée demande confirmation avec le nombre,
+l'espace récupérable (si connu) et un aperçu des noms concernés.
 
 ## 🔍 Fonctionnement
 

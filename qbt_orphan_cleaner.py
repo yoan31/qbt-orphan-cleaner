@@ -183,13 +183,18 @@ def tracker_is_working(tracker):
     return False
 
 
-def check_torrent_trackers(client, torrents):
+def check_torrent_trackers(client, torrents, hashes=None):
     """
     Return the torrents that have no tracker with the Working status.
 
     Each item contains the torrent name, its hash and the known trackers, so it
-    can be reported from the CLI or the web interface.
+    can be reported from the CLI or the web interface. When ``hashes`` is given,
+    only those torrents are checked, which avoids a per-torrent HTTP request for
+    the whole library when only a few hashes are relevant.
     """
+    if hashes is not None:
+        wanted = {h for h in hashes if h}
+        torrents = [t for t in torrents if t.get("hash") in wanted]
     warnings = []
     for torrent in torrents:
         torrent_hash = torrent.get("hash", "")
@@ -476,9 +481,11 @@ def _entry_path(entry):
     """Return the absolute filesystem path for a DiskEntry or DirEntry."""
     return entry.path
 
+
 def _entry_name(entry):
     """Return the display name of a DiskEntry or DirEntry."""
     return entry.name
+
 
 def _entry_is_dir(entry):
     """Return True if entry is a directory. Supports both os.DirEntry and DiskEntry."""

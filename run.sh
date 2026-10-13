@@ -4,9 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$SCRIPT_DIR/.venv"
 
-# Créer le venv s'il n'existe pas encore
+# Create the venv if it does not exist yet
 if [[ ! -d "$VENV_DIR" ]]; then
-    echo "[*] Création du venv..."
+    echo "[*] Creating the venv..."
     python3 -m venv "$VENV_DIR"
     "$VENV_DIR/bin/pip" install --quiet --upgrade pip
     "$VENV_DIR/bin/pip" install --quiet -r "$SCRIPT_DIR/requirements.txt"

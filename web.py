@@ -261,7 +261,7 @@ def _delete_torrent_once(torrent_hash):
         if torrent_hash not in inactive_hashes:
             tracker_warning_hashes = {
                 t.get("hash")
-                for t in _qbt.check_torrent_trackers(client, torrents)
+                for t in _qbt.check_torrent_trackers(client, torrents, hashes=[torrent_hash])
                 if t.get("hash")
             }
             if torrent_hash not in tracker_warning_hashes:
@@ -276,8 +276,15 @@ def _delete_torrent_once(torrent_hash):
         return {"ok": False, "hash": torrent_hash, "error": str(e)}
 
 
-def _eligible_torrent_hashes(client, torrents):
-    """Return the set of hashes that are deletable (inactive or without a Working tracker)."""
+def _eligible_torrent_hashes(client, torrents, hashes=None):
+    """Return the set of hashes that are deletable (inactive or without a Working tracker).
+
+    When ``hashes`` is given, only those torrents are checked, so the tracker
+    lookup cost is O(selected) instead of O(library).
+    """
+    if hashes is not None:
+        wanted = {h for h in hashes if h}
+        torrents = [t for t in torrents if t.get("hash") in wanted]
     inactive_hashes = {
         t.get("hash")
         for t in _qbt.check_inactive_torrents(torrents)
@@ -294,26 +301,30 @@ def _eligible_torrent_hashes(client, torrents):
 def delete_torrents_with_files(hashes):
     """Delete several torrents with their files.
 
-    Torrents and tracker warnings are fetched once and reused across the whole
-    batch, so deleting M hashes does not cost M*N HTTP requests.
+    Only the requested hashes are checked for eligibility, and torrents and
+    tracker warnings are fetched once and reused across the whole batch, so
+    deleting M hashes does not cost M*N (nor N) HTTP requests.
 
     Returns ``{"deleted": [...], "errors": [{"hash": ..., "error": ...}]}``.
     A failure on one hash never blocks the others.
     """
     deleted, errors = [], []
-    try:
-        client = _qbt.QBittorrentClient()
-        client.login()
-        torrents = client.get_torrents()
-        eligible = _eligible_torrent_hashes(client, torrents)
-    except _qbt.QbtError as e:
-        return {"deleted": deleted, "errors": [{"hash": None, "error": str(e)}]}
-
+    valid_hashes = []
     for torrent_hash in hashes:
         if not isinstance(torrent_hash, str) or not torrent_hash.strip():
             errors.append({"hash": torrent_hash, "error": "Missing torrent hash"})
             continue
-        torrent_hash = torrent_hash.strip()
+        valid_hashes.append(torrent_hash.strip())
+
+    try:
+        client = _qbt.QBittorrentClient()
+        client.login()
+        torrents = client.get_torrents()
+        eligible = _eligible_torrent_hashes(client, torrents, hashes=valid_hashes)
+    except _qbt.QbtError as e:
+        return {"deleted": deleted, "errors": [{"hash": None, "error": str(e)}]}
+
+    for torrent_hash in valid_hashes:
         if torrent_hash not in eligible:
             errors.append({
                 "hash": torrent_hash,
@@ -1325,11 +1336,21 @@ function groupRecoverableSize(kind) {
   return arr.filter(t => sel.has(t.hash)).reduce((s, t) => s + Math.max(0, t.size || 0), 0);
 }
 
+function groupNameFor(kind, hash) {
+  const names = { tracker: 'tracker_warnings', activity: 'inactive_torrents' };
+  const arr = (lastScan && Array.isArray(lastScan[names[kind]])) ? lastScan[names[kind]] : [];
+  const found = arr.find(t => t.hash === hash);
+  return (found && found.name) ? found.name : hash;
+}
+
 async function deleteTorrentsBatch(kind, hashes, buttons) {
   if (hashes.length === 0) return;
   const size = groupRecoverableSize(kind);
   const sizeLine = size > 0 ? '\\nRecoverable space: ' + fmtSize(size) : '';
-  if (!confirm('Delete ' + hashes.length + ' torrent(s) and their associated files?' + sizeLine)) {
+  const preview = hashes.slice(0, 5).map(h => '  • ' + groupNameFor(kind, h)).join('\\n');
+  const more = hashes.length > 5 ? '\\n  … and ' + (hashes.length - 5) + ' more' : '';
+  if (!confirm('Delete ' + hashes.length + ' torrent(s) and their associated files?' + sizeLine
+      + '\\n\\n' + preview + more)) {
     return;
   }
   const prev = buttons.map(b => ({ b, text: b.textContent }));

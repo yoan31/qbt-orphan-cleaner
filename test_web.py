@@ -231,6 +231,36 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(len(result["errors"]), 1)
         self.assertEqual(result["errors"][0]["hash"], "ghi")
 
+    def test_delete_torrents_batch_checks_only_requested_hashes(self):
+        tracker_calls = []
+
+        class FakeClient:
+            def login(self):
+                pass
+
+            def get_torrents(self):
+                return [
+                    {"hash": h, "last_activity": int(time.time()), "size": 1}
+                    for h in ["h1", "h2", "h3", "h4", "h5"]
+                ]
+
+            def get_trackers(self, torrent_hash):
+                tracker_calls.append(torrent_hash)
+                return [{"status": 2}]
+
+            def delete_torrent(self, torrent_hash, delete_files=True):
+                pass
+
+        web._qbt.QBittorrentClient = FakeClient
+        web._qbt.LAST_ACTIVITY_DAYS = 30
+
+        result = web.delete_torrents_with_files(["h2"])
+
+        self.assertEqual(tracker_calls, ["h2"])
+        self.assertEqual(result["deleted"], [])
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertEqual(result["errors"][0]["hash"], "h2")
+
     def test_delete_torrents_batch_reports_empty_hash_without_blocking(self):
         calls = []
 

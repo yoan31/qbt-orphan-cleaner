@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-web.py — Interface web pour qBt Orphan Cleaner.
-Démarrage : ./run_web.sh
+web.py — Web interface for qBt Orphan Cleaner.
+Start: ./run_web.sh
 """
 
 import base64
+import errno
 import hmac
 import io
 import json
@@ -23,10 +24,11 @@ __version__ = _qbt.__version__
 
 MAX_JSON_BODY = 1_000_000
 MAX_PATHS_PER_REQUEST = 1000
+MAX_HASHES_PER_REQUEST = 1000
 
 
 class WebError(Exception):
-    """Erreur contrôlée renvoyable à l'interface web."""
+    """Controlled error that can be returned to the web interface."""
 
     def __init__(self, message, status=400):
         super().__init__(message)
@@ -50,23 +52,23 @@ def _path_is_within(path, root):
 
 def _safe_storage_path(path, *, allow_root=False):
     if not isinstance(path, str) or not path.strip():
-        raise WebError("Chemin invalide")
+        raise WebError("Invalid path")
 
     norm = os.path.abspath(os.path.normpath(path))
     root = _storage_root_real()
 
     if not allow_root and norm == root:
-        raise WebError("Chemin racine non autorisé", 403)
+        raise WebError("Root path not allowed", 403)
 
     if os.path.islink(norm):
         parent = os.path.realpath(os.path.dirname(norm))
         if not _path_is_within(parent, root):
-            raise WebError("Chemin non autorisé", 403)
+            raise WebError("Path not allowed", 403)
         return norm
 
     real = os.path.realpath(norm)
     if not _path_is_within(real, root):
-        raise WebError("Chemin non autorisé", 403)
+        raise WebError("Path not allowed", 403)
 
     return real
 
@@ -104,10 +106,10 @@ def _current_orphan_realpaths():
     return current
 
 
-# ── Logique métier ─────────────────────────────────────────────────────────────
+# ── Business logic ─────────────────────────────────────────────────────────────
 
 def run_scan():
-    """Lance le scan ; retourne les orphelins sans taille (calcul lazy) + stats qBt."""
+    """Run the scan; return orphans without size (lazy computation) + qBt stats."""
     try:
         client = _qbt.QBittorrentClient()
         client.login()
@@ -158,7 +160,7 @@ def run_scan():
 
 
 def compute_sizes(paths):
-    """Calcule les tailles pour une liste de chemins absolus."""
+    """Compute sizes for a list of absolute paths."""
     result = {}
     for path in paths:
         try:
@@ -184,7 +186,7 @@ def compute_sizes(paths):
 
 
 def browse_dir(path):
-    """Liste le contenu d'un répertoire. Retourne None si chemin non autorisé."""
+    """List the contents of a directory. Return None if the path is not allowed."""
     try:
         norm_path = _safe_storage_path(path, allow_root=True)
     except WebError:
@@ -207,7 +209,7 @@ def browse_dir(path):
 
 
 def do_delete(paths):
-    """Supprime les chemins validés. Retourne {deleted, errors}."""
+    """Delete the validated paths. Return {deleted, errors}."""
     deleted, errors = [], []
     try:
         current_orphans = _current_orphan_realpaths()
@@ -221,7 +223,7 @@ def do_delete(paths):
             errors.append({"path": path, "error": str(e)})
             continue
         if norm_path not in current_orphans:
-            errors.append({"path": path, "error": "Chemin non orphelin"})
+            errors.append({"path": path, "error": "Path is not an orphan"})
             continue
         try:
             norm_path = _safe_storage_path(path)
@@ -231,15 +233,22 @@ def do_delete(paths):
                 os.remove(norm_path)
             deleted.append(path)
         except OSError as e:
-            errors.append({"path": path, "error": str(e)})
+            if e.errno == errno.EROFS:
+                message = "Storage mounted read-only"
+            elif e.errno in (errno.EACCES, errno.EPERM):
+                message = "Insufficient permissions to delete this item"
+            else:
+                message = str(e)
+            errors.append({"path": path, "error": message})
     return {"deleted": deleted, "errors": errors}
 
 
-def delete_torrent_with_files(torrent_hash):
-    """Supprime un torrent dans qBittorrent avec ses fichiers associés."""
-    if not isinstance(torrent_hash, str) or not torrent_hash.strip():
-        return {"ok": False, "error": "Hash torrent manquant"}
-    torrent_hash = torrent_hash.strip()
+def _delete_torrent_once(torrent_hash):
+    """Delete a single torrent (inactive or without a Working tracker) and its files.
+
+    Returns a dict ``{"ok": True, "hash": ...}`` on success or
+    ``{"ok": False, "hash": ..., "error": ...}`` on failure.
+    """
     try:
         client = _qbt.QBittorrentClient()
         client.login()
@@ -250,11 +259,83 @@ def delete_torrent_with_files(torrent_hash):
             if t.get("hash")
         }
         if torrent_hash not in inactive_hashes:
-            return {"ok": False, "error": "Torrent non inactif ou introuvable"}
+            tracker_warning_hashes = {
+                t.get("hash")
+                for t in _qbt.check_torrent_trackers(client, torrents)
+                if t.get("hash")
+            }
+            if torrent_hash not in tracker_warning_hashes:
+                return {
+                    "ok": False,
+                    "hash": torrent_hash,
+                    "error": "Torrent is neither inactive nor without a Working tracker, or not found",
+                }
         client.delete_torrent(torrent_hash, delete_files=True)
         return {"ok": True, "hash": torrent_hash}
     except _qbt.QbtError as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "hash": torrent_hash, "error": str(e)}
+
+
+def _eligible_torrent_hashes(client, torrents):
+    """Return the set of hashes that are deletable (inactive or without a Working tracker)."""
+    inactive_hashes = {
+        t.get("hash")
+        for t in _qbt.check_inactive_torrents(torrents)
+        if t.get("hash")
+    }
+    tracker_warning_hashes = {
+        t.get("hash")
+        for t in _qbt.check_torrent_trackers(client, torrents)
+        if t.get("hash")
+    }
+    return inactive_hashes | tracker_warning_hashes
+
+
+def delete_torrents_with_files(hashes):
+    """Delete several torrents with their files.
+
+    Torrents and tracker warnings are fetched once and reused across the whole
+    batch, so deleting M hashes does not cost M*N HTTP requests.
+
+    Returns ``{"deleted": [...], "errors": [{"hash": ..., "error": ...}]}``.
+    A failure on one hash never blocks the others.
+    """
+    deleted, errors = [], []
+    try:
+        client = _qbt.QBittorrentClient()
+        client.login()
+        torrents = client.get_torrents()
+        eligible = _eligible_torrent_hashes(client, torrents)
+    except _qbt.QbtError as e:
+        return {"deleted": deleted, "errors": [{"hash": None, "error": str(e)}]}
+
+    for torrent_hash in hashes:
+        if not isinstance(torrent_hash, str) or not torrent_hash.strip():
+            errors.append({"hash": torrent_hash, "error": "Missing torrent hash"})
+            continue
+        torrent_hash = torrent_hash.strip()
+        if torrent_hash not in eligible:
+            errors.append({
+                "hash": torrent_hash,
+                "error": "Torrent is neither inactive nor without a Working tracker, or not found",
+            })
+            continue
+        try:
+            client.delete_torrent(torrent_hash, delete_files=True)
+            deleted.append(torrent_hash)
+        except _qbt.QbtError as e:
+            errors.append({"hash": torrent_hash, "error": str(e)})
+    return {"deleted": deleted, "errors": errors}
+
+
+def delete_torrent_with_files(torrent_hash):
+    """Delete a single torrent with its files (backward-compatible entry point).
+
+    Returns ``{"ok": bool, "hash": ..., "error": ...}``.
+    """
+    if not isinstance(torrent_hash, str) or not torrent_hash.strip():
+        return {"ok": False, "error": "Missing torrent hash"}
+    return _delete_torrent_once(torrent_hash.strip())
 
 
 def get_config():
@@ -273,9 +354,9 @@ def _validate_port(name, value):
     try:
         port = int(value)
     except (TypeError, ValueError):
-        raise WebError(f"{name} doit être un entier")
+        raise WebError(f"{name} must be an integer")
     if not 1 <= port <= 65535:
-        raise WebError(f"{name} doit être entre 1 et 65535")
+        raise WebError(f"{name} must be between 1 and 65535")
     return str(port)
 
 
@@ -289,13 +370,13 @@ def _validate_config(config):
         if not value:
             continue
         if "\n" in value or "\r" in value:
-            raise WebError(f"{key} contient un retour ligne interdit")
+            raise WebError(f"{key} contains a forbidden line break")
         filtered[key] = value
 
     if "QB_HOST" in filtered:
         parsed = urllib.parse.urlparse(filtered["QB_HOST"])
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise WebError("QB_HOST doit être une URL http(s) valide")
+            raise WebError("QB_HOST must be a valid http(s) URL")
         filtered["QB_HOST"] = filtered["QB_HOST"].rstrip("/")
 
     if "QB_PORT" in filtered:
@@ -308,15 +389,15 @@ def _validate_config(config):
         try:
             days = int(filtered["LAST_ACTIVITY_DAYS"])
         except ValueError:
-            raise WebError("LAST_ACTIVITY_DAYS doit être un entier")
+            raise WebError("LAST_ACTIVITY_DAYS must be an integer")
         if days < 0:
-            raise WebError("LAST_ACTIVITY_DAYS doit être positif ou nul")
+            raise WebError("LAST_ACTIVITY_DAYS must be positive or zero")
         filtered["LAST_ACTIVITY_DAYS"] = str(days)
 
     if "STORAGE_DIR" in filtered:
         storage = os.path.abspath(os.path.expanduser(filtered["STORAGE_DIR"]))
         if not os.path.isdir(storage):
-            raise WebError("STORAGE_DIR doit être un répertoire existant")
+            raise WebError("STORAGE_DIR must be an existing directory")
         filtered["STORAGE_DIR"] = storage
 
     return filtered
@@ -329,7 +410,7 @@ def apply_config(config):
 
 
 def export_orphans(fmt):
-    """Scan complet + calcul tailles, retourne (bytes, content_type, filename)."""
+    """Full scan + size computation; return (bytes, content_type, filename)."""
     data = run_scan()
     if "error" in data:
         return None, data["error"]
@@ -552,12 +633,16 @@ main{max-width:1180px;margin:0 auto;padding:16px 28px 48px;width:100%}
   border-radius:var(--r2);padding:14px;margin-bottom:14px;box-shadow:var(--shadow);
 }
 .scan-warnings.inactive{background:var(--warning-bg);border-color:var(--warning-border);color:var(--warning-text)}
-.tw-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}
+.tw-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px;flex-wrap:wrap}
+.tw-head-left{display:flex;align-items:center;gap:8px;min-width:0}
+.tw-head-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.tw-selcount{font-size:12px;color:var(--warning-soft);font-weight:700}
 .tw-title{font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.08em;color:var(--warning-soft)}
 .tw-count{font-size:12px;color:var(--warning-text)}
 .tw-list{display:grid;gap:8px}
 .tw-item{background:var(--warning-card);border:1px solid var(--warning-border);border-radius:9px;padding:10px 12px}
 .tw-row{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.tw-check{flex-shrink:0;margin-right:2px}
 .tw-main{min-width:0;flex:1}
 .tw-name{font-size:13px;font-weight:700;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .tw-reason{font-size:11px;color:var(--warning-text);margin-top:2px}
@@ -821,15 +906,31 @@ body[data-theme="light"] .toast.err{background:#fef2f2;color:#b91c1c}
 <main>
   <div id="tracker-warnings" class="scan-warnings hidden">
     <div class="tw-head">
-      <div class="tw-title">Tracker check</div>
-      <div class="tw-count" id="tw-count"></div>
+      <div class="tw-head-left">
+        <input type="checkbox" id="tw-sel-all" title="Select all in this group">
+        <div class="tw-title">Tracker check</div>
+      </div>
+      <div class="tw-head-right">
+        <span class="tw-selcount" id="tw-selcount"></span>
+        <span class="tw-count" id="tw-count"></span>
+        <button class="btn btn-ghost btn-sm" id="tw-del-sel" disabled>Delete selected</button>
+        <button class="btn btn-danger btn-sm" id="tw-del-all" disabled>Delete all</button>
+      </div>
     </div>
     <div class="tw-list" id="tw-list"></div>
   </div>
   <div id="activity-warnings" class="scan-warnings inactive hidden">
     <div class="tw-head">
-      <div class="tw-title">Last activity</div>
-      <div class="tw-count" id="aw-count"></div>
+      <div class="tw-head-left">
+        <input type="checkbox" id="aw-sel-all" title="Select all in this group">
+        <div class="tw-title">Last activity</div>
+      </div>
+      <div class="tw-head-right">
+        <span class="tw-selcount" id="aw-selcount"></span>
+        <span class="tw-count" id="aw-count"></span>
+        <button class="btn btn-ghost btn-sm" id="aw-del-sel" disabled>Delete selected</button>
+        <button class="btn btn-danger btn-sm" id="aw-del-all" disabled>Delete all</button>
+      </div>
     </div>
     <div class="tw-list" id="aw-list"></div>
   </div>
@@ -921,6 +1022,12 @@ const rowMap = new Map();
 const szMap  = new Map();
 const browsePanels = new Map();
 let browseOpen = new Set();
+let lastScan = null;
+const groupSel = { tracker: new Set(), activity: new Set() };
+const GROUP_IDS = {
+  tracker:  { list: 'tw-list', selAll: 'tw-sel-all', selCount: 'tw-selcount', delSel: 'tw-del-sel', delAll: 'tw-del-all' },
+  activity: { list: 'aw-list', selAll: 'aw-sel-all', selCount: 'aw-selcount', delSel: 'aw-del-sel', delAll: 'aw-del-all' }
+};
 
 function applyTheme(theme) {
   const next = theme === 'light' ? 'light' : 'dark';
@@ -986,6 +1093,7 @@ function renderTrackerWarnings(warnings) {
   const list = $('tw-list');
   warnings = Array.isArray(warnings) ? warnings : [];
   list.innerHTML = '';
+  groupSel.tracker = new Set();
 
   if (warnings.length === 0) {
     box.classList.add('hidden');
@@ -996,17 +1104,48 @@ function renderTrackerWarnings(warnings) {
   warnings.forEach(w => {
     const item = document.createElement('div');
     item.className = 'tw-item';
+    item.dataset.hash = w.hash || '';
+
+    const row = document.createElement('div');
+    row.className = 'tw-row';
+
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.className = 'tw-check';
+    cb.checked = false;
+    cb.disabled = !w.hash;
+    cb.title = 'Select this torrent';
+    cb.addEventListener('change', () => toggleGroupHash('tracker', w.hash, cb.checked));
+    row.appendChild(cb);
+
+    const main = document.createElement('div');
+    main.className = 'tw-main';
 
     const name = document.createElement('div');
     name.className = 'tw-name';
     name.title = w.hash || '';
     name.textContent = w.name || '(unnamed torrent)';
-    item.appendChild(name);
+    main.appendChild(name);
 
     const reason = document.createElement('div');
     reason.className = 'tw-reason';
     reason.textContent = w.reason || 'No Working tracker';
-    item.appendChild(reason);
+    main.appendChild(reason);
+
+    const actions = document.createElement('div');
+    actions.className = 'tw-actions';
+    const del = document.createElement('button');
+    del.className = 'btn btn-danger btn-torrent-del';
+    del.type = 'button';
+    del.textContent = 'Delete';
+    del.disabled = !w.hash;
+    del.title = 'Delete the torrent and its files';
+    del.addEventListener('click', () => deleteTorrentWithFiles(w, del));
+    actions.appendChild(del);
+
+    row.appendChild(main);
+    row.appendChild(actions);
+    item.appendChild(row);
 
     const trackers = Array.isArray(w.trackers) ? w.trackers.slice(0, 4) : [];
     if (trackers.length > 0) {
@@ -1032,6 +1171,7 @@ function renderActivityWarnings(inactive, thresholdDays) {
   const list = $('aw-list');
   inactive = Array.isArray(inactive) ? inactive : [];
   list.innerHTML = '';
+  groupSel.activity = new Set();
 
   if (thresholdDays <= 0 || inactive.length === 0) {
     box.classList.add('hidden');
@@ -1046,8 +1186,19 @@ function renderActivityWarnings(inactive, thresholdDays) {
 
     const row = document.createElement('div');
     row.className = 'tw-row';
+
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.className = 'tw-check';
+    cb.checked = false;
+    cb.disabled = !t.hash;
+    cb.title = 'Select this torrent';
+    cb.addEventListener('change', () => toggleGroupHash('activity', t.hash, cb.checked));
+    row.appendChild(cb);
+
     const main = document.createElement('div');
     main.className = 'tw-main';
+
     const name = document.createElement('div');
     name.className = 'tw-name';
     name.title = t.hash || '';
@@ -1080,10 +1231,10 @@ function renderActivityWarnings(inactive, thresholdDays) {
     const del = document.createElement('button');
     del.className = 'btn btn-danger btn-torrent-del';
     del.type = 'button';
-    del.textContent = 'Supprimer';
+    del.textContent = 'Delete';
     del.disabled = !t.hash;
-    del.title = 'Supprimer le torrent et ses fichiers';
-    del.addEventListener('click', () => deleteInactiveTorrent(t, del));
+    del.title = 'Delete the torrent and its files';
+    del.addEventListener('click', () => deleteTorrentWithFiles(t, del));
     actions.appendChild(del);
 
     row.appendChild(main);
@@ -1095,10 +1246,13 @@ function renderActivityWarnings(inactive, thresholdDays) {
   box.classList.remove('hidden');
 }
 
-async function deleteInactiveTorrent(torrent, btn) {
+async function deleteTorrentWithFiles(torrent, btn) {
   const name = torrent.name || '(unnamed torrent)';
   const size = torrent.size_h || fmtSize(torrent.size || 0);
-  if (!confirm('Supprimer le torrent "' + name + '" et ses fichiers associes ?\\nEspace recuperable: ' + size)) {
+  const sizeLine = torrent.size !== undefined || torrent.size_h
+    ? '\\nRecoverable space: ' + size
+    : '';
+  if (!confirm('Delete the torrent "' + name + '" and its associated files?' + sizeLine)) {
     return;
   }
   btn.disabled = true;
@@ -1113,15 +1267,94 @@ async function deleteInactiveTorrent(torrent, btn) {
     if (!data.ok) {
       toast(data.error || 'Torrent delete failed', 'err');
       btn.disabled = false;
-      btn.textContent = 'Supprimer';
+      btn.textContent = 'Delete';
       return;
     }
-    toast('Torrent supprime: ' + name, 'ok');
+    toast('Torrent deleted: ' + name, 'ok');
     doScan();
   } catch(e) {
     toast('Network error: ' + e.message, 'err');
     btn.disabled = false;
-    btn.textContent = 'Supprimer';
+    btn.textContent = 'Delete';
+  }
+}
+
+// ── Grouped torrent selection & deletion ───────────────────
+function groupItems(kind) {
+  const list = $(GROUP_IDS[kind].list);
+  return Array.from(list.querySelectorAll('.tw-item'));
+}
+
+function updateGroupSel(kind) {
+  const ids = GROUP_IDS[kind];
+  const sel = groupSel[kind];
+  const items = groupItems(kind);
+  const eligible = items.filter(it => it.dataset.hash);
+  eligible.forEach(it => {
+    const cb = it.querySelector('input[type=checkbox]');
+    if (cb) cb.checked = sel.has(it.dataset.hash);
+  });
+  const n = sel.size;
+  $(ids.selCount).textContent = n > 0 ? n + ' selected' : '';
+  const selAll = $(ids.selAll);
+  selAll.checked = eligible.length > 0 && n >= eligible.length;
+  selAll.indeterminate = n > 0 && n < eligible.length;
+  selAll.disabled = eligible.length === 0;
+  $(ids.delSel).disabled = n === 0;
+  $(ids.delAll).disabled = eligible.length === 0;
+}
+
+function toggleGroupHash(kind, hash, checked) {
+  if (!hash) return;
+  if (checked) groupSel[kind].add(hash);
+  else groupSel[kind].delete(hash);
+  updateGroupSel(kind);
+}
+
+function setGroupAll(kind, checked) {
+  const sel = groupSel[kind];
+  sel.clear();
+  if (checked) groupItems(kind).forEach(it => { if (it.dataset.hash) sel.add(it.dataset.hash); });
+  updateGroupSel(kind);
+}
+
+function groupRecoverableSize(kind) {
+  const names = { tracker: 'tracker_warnings', activity: 'inactive_torrents' };
+  const arr = (lastScan && Array.isArray(lastScan[names[kind]])) ? lastScan[names[kind]] : [];
+  const sel = groupSel[kind];
+  return arr.filter(t => sel.has(t.hash)).reduce((s, t) => s + Math.max(0, t.size || 0), 0);
+}
+
+async function deleteTorrentsBatch(kind, hashes, buttons) {
+  if (hashes.length === 0) return;
+  const size = groupRecoverableSize(kind);
+  const sizeLine = size > 0 ? '\\nRecoverable space: ' + fmtSize(size) : '';
+  if (!confirm('Delete ' + hashes.length + ' torrent(s) and their associated files?' + sizeLine)) {
+    return;
+  }
+  const prev = buttons.map(b => ({ b, text: b.textContent }));
+  buttons.forEach(b => { b.disabled = true; b.textContent = '...'; });
+  try {
+    const r = await fetch('/api/delete-torrent', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({hashes})
+    });
+    const data = await r.json();
+    const deleted = Array.isArray(data.deleted) ? data.deleted.length : 0;
+    const errors = Array.isArray(data.errors) ? data.errors : [];
+    if (errors.length === 0) {
+      toast('✓ ' + deleted + ' torrent(s) deleted', 'ok');
+    } else {
+      const details = errors.slice(0, 3).map(e => e.error || 'Unknown error').join(' · ');
+      toast(deleted + ' deleted, ' + errors.length + ' failed' + (details ? ': ' + details : ''), 'err', 8000);
+    }
+    doScan();
+  } catch(e) {
+    toast('Network error: ' + e.message, 'err');
+  } finally {
+    prev.forEach(({ b, text }) => { b.disabled = false; b.textContent = text; });
+    updateGroupSel(kind);
   }
 }
 
@@ -1182,6 +1415,7 @@ function applyFilter() {
 }
 
 function renderOrphans(data) {
+  lastScan = data;
   orphans = data.orphans;
   selected.clear();
   rowMap.clear();
@@ -1198,6 +1432,8 @@ function renderOrphans(data) {
   updateDash(data);
   renderTrackerWarnings(data.tracker_warnings);
   renderActivityWarnings(data.inactive_torrents, data.last_activity_days);
+  updateGroupSel('tracker');
+  updateGroupSel('activity');
 
   const list = $('orphan-list');
   list.innerHTML = '';
@@ -1455,7 +1691,15 @@ async function doDelete() {
     if (data.errors.length === 0) {
       toast('✓ ' + data.deleted.length + ' item(s) deleted', 'ok');
     } else {
-      toast(data.deleted.length + ' deleted, ' + data.errors.length + ' error(s)', 'err');
+      const details = data.errors.slice(0, 3)
+        .map(e => e.error || 'Unknown error')
+        .join(' · ');
+      toast(
+        data.deleted.length + ' deleted, ' + data.errors.length + ' error(s)'
+          + (details ? ': ' + details : ''),
+        'err',
+        8000
+      );
     }
   } catch(e) {
     toast('Network error: ' + e.message, 'err');
@@ -1517,6 +1761,20 @@ $('sel-all').addEventListener('change', e => {
   updateSel();
 });
 $('btn-del').addEventListener('click', openModal);
+
+['tracker', 'activity'].forEach(kind => {
+  const ids = GROUP_IDS[kind];
+  $(ids.selAll).addEventListener('change', e => setGroupAll(kind, e.target.checked));
+  $(ids.delSel).addEventListener('click', () => {
+    const hashes = [...groupSel[kind]];
+    deleteTorrentsBatch(kind, hashes, [$(ids.delSel), $(ids.delAll)]);
+  });
+  $(ids.delAll).addEventListener('click', () => {
+    const hashes = groupItems(kind).filter(it => it.dataset.hash).map(it => it.dataset.hash);
+    deleteTorrentsBatch(kind, hashes, [$(ids.delSel), $(ids.delAll)]);
+  });
+});
+
 $('modal-cancel').addEventListener('click', () => $('modal').classList.add('hidden'));
 $('modal-bd').addEventListener('click',     () => $('modal').classList.add('hidden'));
 $('modal-ok').addEventListener('click', doDelete);
@@ -1563,7 +1821,7 @@ doScan();
 """
 
 
-# ── Serveur HTTP ───────────────────────────────────────────────────────────────
+# ── HTTP server ────────────────────────────────────────────────────────────────
 
 _WEB_AUTH = os.environ.get("WEB_AUTH", "")  # format "user:pass"
 
@@ -1571,7 +1829,7 @@ _WEB_AUTH = os.environ.get("WEB_AUTH", "")  # format "user:pass"
 class Handler(BaseHTTPRequestHandler):
 
     def _check_auth(self):
-        """Retourne True si auth OK ou non configurée. Envoie 401 et retourne False sinon."""
+        """Return True if auth is OK or not configured. Send 401 and return False otherwise."""
         if not _WEB_AUTH:
             return True
         auth_header = self.headers.get("Authorization", "")
@@ -1622,11 +1880,11 @@ class Handler(BaseHTTPRequestHandler):
         elif path.startswith("/api/browse"):
             p = (qs.get("path") or [""])[0]
             if not p:
-                self._json({"error": "Paramètre 'path' manquant"}, 400)
+                self._json({"error": "Missing 'path' parameter"}, 400)
                 return
             result = browse_dir(p)
             if result is None:
-                self._json({"error": "Chemin non autorisé"}, 403)
+                self._json({"error": "Path not allowed"}, 403)
             else:
                 self._json(result)
         else:
@@ -1641,11 +1899,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": str(e)}, e.status)
             return
         except (json.JSONDecodeError, UnicodeDecodeError):
-            self._json({"error": "JSON invalide"}, 400)
+            self._json({"error": "Invalid JSON"}, 400)
             return
 
         if not isinstance(body, dict):
-            self._json({"error": "Corps JSON invalide"}, 400)
+            self._json({"error": "Invalid JSON body"}, 400)
             return
 
         parsed = urllib.parse.urlparse(self.path)
@@ -1654,25 +1912,41 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/delete":
             paths = body.get("paths", [])
             if not isinstance(paths, list):
-                self._json({"error": "paths doit être une liste"}, 400)
+                self._json({"error": "paths must be a list"}, 400)
                 return
             if len(paths) > MAX_PATHS_PER_REQUEST:
-                self._json({"error": "Trop de chemins demandés"}, 413)
+                self._json({"error": "Too many paths requested"}, 413)
                 return
             self._json(do_delete(paths))
 
         elif path == "/api/delete-torrent":
-            torrent_hash = body.get("hash", "")
-            result = delete_torrent_with_files(torrent_hash)
-            self._json(result, 200 if result.get("ok") else 400)
+            hashes = body.get("hashes")
+            if hashes is None:
+                single = body.get("hash", "")
+                hashes = [single] if single else []
+            if not isinstance(hashes, list):
+                self._json({"error": "hashes must be a list"}, 400)
+                return
+            if len(hashes) > MAX_HASHES_PER_REQUEST:
+                self._json({"error": "Too many hashes requested"}, 413)
+                return
+            if not hashes:
+                self._json({"ok": False, "error": "Missing torrent hash"}, 400)
+                return
+            if len(hashes) == 1 and "hashes" not in body:
+                result = delete_torrent_with_files(hashes[0])
+                self._json(result, 200 if result.get("ok") else 400)
+            else:
+                result = delete_torrents_with_files(hashes)
+                self._json(result, 200)
 
         elif path == "/api/sizes":
             paths = body.get("paths", [])
             if not isinstance(paths, list):
-                self._json({"error": "paths doit être une liste"}, 400)
+                self._json({"error": "paths must be a list"}, 400)
                 return
             if len(paths) > MAX_PATHS_PER_REQUEST:
-                self._json({"error": "Trop de chemins demandés"}, 413)
+                self._json({"error": "Too many paths requested"}, 413)
                 return
             self._json({"sizes": compute_sizes(paths)})
 
@@ -1692,11 +1966,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", 0))
         except ValueError:
-            raise WebError("Content-Length invalide")
+            raise WebError("Invalid Content-Length")
         if length <= 0:
-            raise WebError("Corps JSON manquant")
+            raise WebError("Missing JSON body")
         if length > MAX_JSON_BODY:
-            raise WebError("Corps JSON trop volumineux", 413)
+            raise WebError("JSON body too large", 413)
         return json.loads(self.rfile.read(length).decode("utf-8"))
 
     def _send(self, status, ctype, body: bytes):
@@ -1716,21 +1990,21 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     if not _is_loopback_host(WEB_HOST) and not _WEB_AUTH:
-        raise SystemExit("WEB_AUTH est requis lorsque WEB_HOST n'est pas localhost")
+        raise SystemExit("WEB_AUTH is required when WEB_HOST is not localhost")
     server = ThreadingHTTPServer((WEB_HOST, WEB_PORT), Handler)
     local_url = f"http://localhost:{WEB_PORT}"
     print("=" * 50)
-    print("  qBt Orphan Cleaner — Interface Web")
+    print("  qBt Orphan Cleaner — Web Interface")
     print("=" * 50)
     print(f"  URL        : {local_url}")
-    print(f"  Stockage   : {_qbt.STORAGE_DIR}")
+    print(f"  Storage    : {_qbt.STORAGE_DIR}")
     print(f"  qBittorrent: {_qbt.BASE_URL}")
-    print("  Ctrl+C pour arrêter")
+    print("  Ctrl+C to stop")
     print("=" * 50)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nArrêt du serveur.")
+        print("\nServer stopped.")
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@
 # Claude Code local state
 .claude/
 
-# Config locale avec credentials
+# Local config with credentials
 .env
 
 # Venv

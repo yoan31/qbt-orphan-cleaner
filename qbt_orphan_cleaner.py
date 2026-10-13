@@ -2,10 +2,10 @@
 """
 qbt_orphan_cleaner.py
 ---------------------
-Détecte les fichiers présents dans un répertoire de stockage qui ne correspondent
-à aucun téléchargement actif dans qBittorrent, puis propose leur suppression interactive.
+Detects files present in a storage directory that no longer correspond to any
+active download in qBittorrent, then offers interactive deletion.
 
-Dépendances : aucune (stdlib uniquement)
+Dependencies: none (standard library only)
 """
 
 import argparse
@@ -13,7 +13,6 @@ import csv
 from dataclasses import dataclass
 import json
 import http.cookiejar
-import io
 import os
 import shutil
 import sys
@@ -23,15 +22,20 @@ import urllib.parse
 import urllib.request
 
 
-__version__ = "1.0.2"
+__version__ = "1.0.4"
 
 
 class QbtError(Exception):
-    """Erreur de communication avec qBittorrent ou de configuration."""
+    """Error while communicating with qBittorrent or in configuration."""
 
 
 def _load_env():
-    """Charge les variables depuis un fichier .env situé à côté du script."""
+    """Load environment variables from a .env file located next to the script.
+
+    The file is optional; missing or malformed lines are ignored.  Variables are
+    added to `os.environ` only if they are not already defined, preserving any
+    values the user may have set externally.
+    """
     env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     if not os.path.exists(env_path):
         return
@@ -46,14 +50,18 @@ def _load_env():
 _load_env()
 
 
-def _env_int(name, default):
+def _env_int(name: str, default: int) -> int:
+    """Return an environment variable as ``int`` with a fallback to ``default``.
+
+    ``default`` is returned when the variable is missing or cannot be cast to an integer.
+    """
     try:
         return int(os.environ.get(name, str(default)))
     except ValueError:
         return default
 
 # ─────────────────────────────────────────────
-#  CONFIGURATION  (via .env ou variables d'environnement)
+#  CONFIGURATION  (via .env or environment variables)
 # ─────────────────────────────────────────────
 QB_HOST = os.environ.get("QB_HOST", "http://localhost")
 QB_PORT = int(os.environ.get("QB_PORT", "8080"))
@@ -95,16 +103,23 @@ class QBittorrentClient:
             urllib.request.HTTPCookieProcessor(self.cookie_jar)
         )
 
-    def _post(self, path, data=None):
+    def _post_response(self, path, data=None):
         url = f"{BASE_URL}{path}"
         payload = urllib.parse.urlencode(data or {}).encode()
-        req = urllib.request.Request(url, data=payload, method="POST")
+        req = urllib.request.Request(url, data=payload)
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
         try:
             with self.opener.open(req, timeout=10) as resp:
-                return resp.read().decode()
+                return resp.status, resp.read().decode()
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="ignore")
+            raise QbtError(f"HTTP error {e.code} contacting qBittorrent: {e.reason}. Body: {body}")
         except urllib.error.URLError as e:
-            raise QbtError(f"Impossible de contacter qBittorrent : {e}")
+            raise QbtError(f"Unable to contact qBittorrent: {e}")
+
+    def _post(self, path, data=None):
+        _, body = self._post_response(path, data)
+        return body
 
     def _get(self, path):
         url = f"{BASE_URL}{path}"
@@ -112,14 +127,26 @@ class QBittorrentClient:
         try:
             with self.opener.open(req, timeout=10) as resp:
                 return resp.read().decode()
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="ignore")
+            raise QbtError(f"HTTP error {e.code} during GET {path}: {e.reason}. Body: {body}")
         except urllib.error.URLError as e:
-            raise QbtError(f"Requête échouée ({path}) : {e}")
+            raise QbtError(f"Request failed ({path}): {e}")
 
     def login(self):
-        result = self._post("/api/v2/auth/login", {"username": QB_USER, "password": QB_PASS})
-        if result.strip() != "Ok.":
-            raise QbtError(f"Authentification échouée (réponse : {result!r})")
-        print("[OK] Connecté à qBittorrent WebUI")
+        """Authenticate against the qBittorrent WebUI.
+
+        qBittorrent <= 5.1 returns HTTP 200 with the plain text ``Ok.`` on
+        success. qBittorrent >= 5.2 returns HTTP 204 with an empty body instead.
+        Both responses establish the session through the cookie jar.
+        """
+        status, result = self._post_response(
+            "/api/v2/auth/login",
+            {"username": QB_USER, "password": QB_PASS},
+        )
+        if status != 204 and result.strip() != "Ok.":
+            raise QbtError(f"Authentication failed (response: {result!r})")
+        print("[OK] Connected to qBittorrent WebUI")
 
     def get_torrents(self):
         raw = self._get("/api/v2/torrents/info")
@@ -138,7 +165,7 @@ class QBittorrentClient:
 
 
 def tracker_status_label(status):
-    """Retourne un libellé stable pour le status tracker qBittorrent."""
+    """Return a stable label for a qBittorrent tracker status."""
     if isinstance(status, int):
         return TRACKER_STATUS_LABELS.get(status, str(status))
     if isinstance(status, str):
@@ -147,7 +174,7 @@ def tracker_status_label(status):
 
 
 def tracker_is_working(tracker):
-    """qBittorrent expose normalement Working avec le code 2."""
+    """qBittorrent normally exposes Working with status code 2."""
     status = tracker.get("status")
     if status == 2:
         return True
@@ -158,21 +185,21 @@ def tracker_is_working(tracker):
 
 def check_torrent_trackers(client, torrents):
     """
-    Retourne les torrents qui n'ont aucun tracker avec le status Working.
+    Return the torrents that have no tracker with the Working status.
 
-    Chaque élément contient le nom du torrent, son hash et les trackers connus,
-    afin de pouvoir le signaler côté CLI ou interface web.
+    Each item contains the torrent name, its hash and the known trackers, so it
+    can be reported from the CLI or the web interface.
     """
     warnings = []
     for torrent in torrents:
         torrent_hash = torrent.get("hash", "")
-        name = torrent.get("name", torrent_hash or "(torrent sans nom)")
+        name = torrent.get("name", torrent_hash or "(unnamed torrent)")
         if not torrent_hash:
             warnings.append({
                 "name": name,
                 "hash": "",
                 "state": torrent.get("state", ""),
-                "reason": "hash manquant",
+                "reason": "missing hash",
                 "trackers": [],
             })
             continue
@@ -196,7 +223,7 @@ def check_torrent_trackers(client, torrents):
             "name": name,
             "hash": torrent_hash,
             "state": torrent.get("state", ""),
-            "reason": "aucun tracker Working",
+            "reason": "no Working tracker",
             "trackers": [
                 {
                     "url": tracker.get("url", ""),
@@ -211,17 +238,17 @@ def check_torrent_trackers(client, torrents):
 
 def print_tracker_warnings(tracker_warnings):
     if not tracker_warnings:
-        print("[OK] Tous les torrents ont au moins un tracker Working")
+        print("[OK] All torrents have at least one Working tracker")
         return
 
-    print(f"[AVERT] {len(tracker_warnings)} torrent(s) sans tracker Working :")
+    print(f"[WARN] {len(tracker_warnings)} torrent(s) without a Working tracker:")
     for warning in tracker_warnings:
         print(f"  - {warning['name']} ({warning['reason']})")
         trackers = warning.get("trackers") or []
         if not trackers:
             continue
         for tracker in trackers:
-            url = tracker.get("url") or "(tracker sans URL)"
+            url = tracker.get("url") or "(tracker without URL)"
             status = tracker.get("status") or "Unknown"
             message = tracker.get("message") or ""
             suffix = f" — {message}" if message else ""
@@ -230,7 +257,7 @@ def print_tracker_warnings(tracker_warnings):
 
 def format_timestamp(timestamp):
     if not timestamp:
-        return "jamais"
+        return "never"
     try:
         return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(timestamp)))
     except (OSError, OverflowError, ValueError, TypeError):
@@ -239,10 +266,10 @@ def format_timestamp(timestamp):
 
 def check_inactive_torrents(torrents, max_inactive_days=None):
     """
-    Retourne les torrents dont la dernière activité dépasse le seuil configuré.
+    Return the torrents whose last activity exceeds the configured threshold.
 
-    qBittorrent expose last_activity comme timestamp Unix. Une valeur 0 signifie
-    aucune activité connue et est donc signalée lorsque le contrôle est actif.
+    qBittorrent exposes last_activity as a Unix timestamp. A value of 0 means no
+    known activity and is therefore reported when the check is enabled.
     """
     days = LAST_ACTIVITY_DAYS if max_inactive_days is None else max_inactive_days
     if days <= 0:
@@ -261,7 +288,7 @@ def check_inactive_torrents(torrents, max_inactive_days=None):
             continue
 
         inactive.append({
-            "name": torrent.get("name", torrent.get("hash", "(torrent sans nom)")),
+            "name": torrent.get("name", torrent.get("hash", "(unnamed torrent)")),
             "hash": torrent.get("hash", ""),
             "state": torrent.get("state", ""),
             "size": torrent.get("size", 0),
@@ -277,18 +304,18 @@ def check_inactive_torrents(torrents, max_inactive_days=None):
 def print_inactive_torrent_warnings(inactive_torrents, max_inactive_days=None):
     days = LAST_ACTIVITY_DAYS if max_inactive_days is None else max_inactive_days
     if days <= 0:
-        print("[INFO] Vérification dernière activité désactivée")
+        print("[INFO] Last activity check disabled")
         return
 
     if not inactive_torrents:
-        print(f"[OK] Aucun torrent inactif depuis plus de {days} jour(s)")
+        print(f"[OK] No torrent inactive for more than {days} day(s)")
         return
 
-    print(f"[AVERT] {len(inactive_torrents)} torrent(s) inactif(s) depuis plus de {days} jour(s) :")
+    print(f"[WARN] {len(inactive_torrents)} torrent(s) inactive for more than {days} day(s):")
     for torrent in inactive_torrents:
         inactive_days = torrent.get("inactive_days")
-        days = "jamais actif" if inactive_days is None else f"{inactive_days} jour(s)"
-        print(f"  - {torrent['name']} — dernière activité : {torrent['last_activity_h']} ({days})")
+        days = "never active" if inactive_days is None else f"{inactive_days} day(s)"
+        print(f"  - {torrent['name']} — last activity: {torrent['last_activity_h']} ({days})")
 
 
 def _storage_root_real():
@@ -326,27 +353,27 @@ def _known_names_for_torrent(torrent):
 
 def collect_known_files(client):
     """
-    Retourne (known_by_scope, category_dirs, torrents).
+    Return (known_by_scope, category_dirs, torrents).
 
-    known_by_scope mappe chaque portée à ses noms connus :
-      ""       – enfants directs de STORAGE_DIR
-      "radarr" – enfants directs du sous-dossier STORAGE_DIR/radarr
+    known_by_scope maps each scope to its known names:
+      ""       – direct children of STORAGE_DIR
+      "radarr" – direct children of the STORAGE_DIR/radarr subfolder
 
-    La portée d'un torrent est déduite de basename(save_path) uniquement si ce
-    basename correspond à un sous-dossier local existant de STORAGE_DIR.
+    A torrent's scope is derived from basename(save_path) only when that
+    basename matches an existing local subfolder of STORAGE_DIR.
     """
     norm_storage = os.path.normpath(STORAGE_DIR)
     known_by_scope = {"": set()}
     category_dirs = {}
 
     torrents = client.get_torrents()
-    print(f"[INFO] {len(torrents)} torrent(s) trouvé(s) dans qBittorrent")
+    print(f"[INFO] {len(torrents)} torrent(s) found in qBittorrent")
 
     for t in torrents:
         save_path = t.get("save_path", "").rstrip("/\\")
         scope = ""
 
-        # Compatibilité remote : seul basename(save_path) est comparé au montage local.
+        # Remote compatibility: only basename(save_path) is compared to the local mount.
         save_basename = os.path.basename(save_path) if save_path else ""
         if save_basename:
             local_cat = os.path.join(norm_storage, save_basename)
@@ -361,19 +388,19 @@ def collect_known_files(client):
 
 def scan_storage(directory, category_dirs):
     """
-    Retourne la liste des DirEntry candidates à la détection d'orphelins.
-    Effectue un scan à 2 niveaux :
-      Niveau 0 – enfants directs de `directory` :
-        - Les entrées cachées (nom commençant par '.') sont ignorées.
-        - Les entrées dans IGNORE_NAMES ou avec IGNORE_EXTENSIONS sont ignorées.
-        - Les répertoires de catégorie (présents dans `category_dirs`) ne sont
-          pas ajoutés : leur contenu est scanné à la place (niveau 1).
-      Niveau 1 – enfants directs de chaque répertoire de catégorie :
-        - Mêmes filtres, pas de récursion supplémentaire.
-    Rétrocompatible : si `category_dirs` est vide, seul le niveau 0 est scanné.
+    Return the list of DirEntry candidates for orphan detection.
+    Performs a 2-level scan:
+      Level 0 – direct children of `directory`:
+        - Hidden entries (name starting with '.') are ignored.
+        - Entries in IGNORE_NAMES or with an IGNORE_EXTENSIONS extension are ignored.
+        - Category directories (present in `category_dirs`) are not added: their
+          contents are scanned instead (level 1).
+      Level 1 – direct children of each category directory:
+        - Same filters, no further recursion.
+    Backward compatible: if `category_dirs` is empty, only level 0 is scanned.
     """
     if not os.path.isdir(directory):
-        raise QbtError(f"Répertoire introuvable : {directory}")
+        raise QbtError(f"Directory not found: {directory}")
     norm_storage = os.path.normpath(directory)
     category_map = dict(category_dirs) if isinstance(category_dirs, dict) else {
         os.path.basename(os.path.normpath(path)): os.path.normpath(path)
@@ -406,7 +433,7 @@ def scan_storage(directory, category_dirs):
                             if not _should_skip(inner):
                                 entries.append(_entry_from_direntry(inner, norm_storage, category))
                 except OSError as e:
-                    print(f"[AVERT] Impossible de scanner {entry.path} : {e}")
+                    print(f"[WARN] Unable to scan {entry.path}: {e}")
                 continue
             entries.append(_entry_from_direntry(entry, norm_storage))
     return entries
@@ -446,14 +473,15 @@ def format_size(size_bytes):
 
 
 def _entry_path(entry):
+    """Return the absolute filesystem path for a DiskEntry or DirEntry."""
     return entry.path
 
-
 def _entry_name(entry):
+    """Return the display name of a DiskEntry or DirEntry."""
     return entry.name
 
-
 def _entry_is_dir(entry):
+    """Return True if entry is a directory. Supports both os.DirEntry and DiskEntry."""
     is_dir = getattr(entry, "is_dir", False)
     if callable(is_dir):
         return is_dir(follow_symlinks=False)
@@ -467,7 +495,7 @@ def _entry_rel_path(entry):
 
 
 def export_report(orphans, path):
-    """Exporte la liste des orphelins en CSV ou JSON selon l'extension de `path`."""
+    """Export the orphan list to CSV or JSON depending on the extension of `path`."""
     ext = os.path.splitext(path)[1].lower()
     rows = [
         {
@@ -488,7 +516,7 @@ def export_report(orphans, path):
             writer = csv.DictWriter(f, fieldnames=["type", "name", "rel_path", "abs_path", "size_bytes", "size_human", "category"])
             writer.writeheader()
             writer.writerows(rows)
-    print(f"[INFO] Rapport exporté → {path} ({len(rows)} entrée(s))")
+    print(f"[INFO] Report exported → {path} ({len(rows)} entry/entries)")
 
 
 def get_entry_size(entry):
@@ -511,10 +539,10 @@ def get_entry_size(entry):
 
 def interactive_cleanup(orphans):
     """
-    Présente les fichiers orphelins et propose suppression au choix.
+    Present the orphan files and offer deletion by choice.
     """
     print("\n" + "═" * 60)
-    print(f"  {len(orphans)} fichier(s)/dossier(s) ORPHELIN(S) détecté(s)")
+    print(f"  {len(orphans)} ORPHAN file(s)/folder(s) detected")
     print("═" * 60)
 
     total_size = 0
@@ -524,30 +552,30 @@ def interactive_cleanup(orphans):
         print(f"  [{i:>3}] {kind} {rel}  ({format_size(size)})")
         total_size += size
 
-    print(f"\n  Taille totale récupérable : {format_size(total_size)}")
+    print(f"\n  Total recoverable size: {format_size(total_size)}")
     print("═" * 60)
 
-    print("\nOptions :")
-    print("  [numéro]   → supprimer un fichier spécifique  (ex: 1 3 5)")
-    print("  [a]        → tout supprimer")
-    print("  [q]        → quitter sans rien supprimer")
+    print("\nOptions:")
+    print("  [number]   → delete a specific file  (e.g. 1 3 5)")
+    print("  [a]        → delete everything")
+    print("  [q]        → quit without deleting anything")
 
     while True:
-        choice = input("\nVotre choix : ").strip().lower()
+        choice = input("\nYour choice: ").strip().lower()
 
         if choice == "q":
-            print("Aucune suppression effectuée. Au revoir.")
+            print("No deletion performed. Goodbye.")
             break
 
         elif choice == "a":
-            confirm = input(f"⚠️  Supprimer les {len(orphans)} entrées ? (oui/non) : ").strip().lower()
+            confirm = input(f"⚠️  Delete all {len(orphans)} entries? (yes/no): ").strip().lower()
             if confirm in {"oui", "yes", "y"}:
                 _delete_entries([e for e, _ in orphans])
             else:
-                print("Annulé.")
+                print("Cancelled.")
 
         else:
-            # Sélection par numéros séparés par espaces
+            # Selection by numbers separated by spaces
             try:
                 indices = [int(x) - 1 for x in choice.split()]
                 selected = []
@@ -555,16 +583,16 @@ def interactive_cleanup(orphans):
                     if 0 <= idx < len(orphans):
                         selected.append(orphans[idx][0])
                     else:
-                        print(f"  [!] Numéro {idx + 1} invalide, ignoré.")
+                        print(f"  [!] Number {idx + 1} invalid, ignored.")
                 if selected:
                     names = ", ".join(_entry_name(e) for e in selected)
-                    confirm = input(f"Supprimer : {names} ? (oui/non) : ").strip().lower()
+                    confirm = input(f"Delete: {names}? (yes/no): ").strip().lower()
                     if confirm in {"oui", "yes", "y"}:
                         _delete_entries(selected)
                     else:
-                        print("Annulé.")
+                        print("Cancelled.")
             except ValueError:
-                print("  [!] Entrée non reconnue, réessayez.")
+                print("  [!] Unrecognized input, please try again.")
 
 
 def _delete_entries(entries):
@@ -574,24 +602,27 @@ def _delete_entries(entries):
         real_path = os.path.realpath(path)
         parent_real = os.path.realpath(os.path.dirname(path))
         if not _path_is_within(parent_real, root) or (not os.path.islink(path) and not _path_is_within(real_path, root)):
-            print(f"  [✗] Refus suppression hors stockage : {_entry_name(entry)}")
+            print(f"  [✗] Deletion refused outside storage: {_entry_name(entry)}")
             continue
         if not os.path.lexists(path):
-            print(f"  [✗] Introuvable, ignoré : {_entry_name(entry)}")
+            print(f"  [✗] Not found, skipped: {_entry_name(entry)}")
             continue
         try:
             if _entry_is_dir(entry):
-                shutil.rmtree(path)
+                if os.path.islink(path):
+                    os.remove(path)
+                else:
+                    shutil.rmtree(path)
             else:
                 os.remove(path)
-            print(f"  [✓] Supprimé : {_entry_name(entry)}")
+            print(f"  [✓] Deleted: {_entry_name(entry)}")
         except OSError as e:
-            print(f"  [✗] Erreur suppression {_entry_name(entry)} : {e}")
+            print(f"  [✗] Deletion error {_entry_name(entry)}: {e}")
 
 
 def save_env(config: dict):
-    """Sauvegarde les clés de `config` dans le fichier .env.
-    Les clés existantes sont mises à jour ; les nouvelles sont ajoutées."""
+    """Save the keys of `config` to the .env file.
+    Existing keys are updated; new ones are appended."""
     env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     lines = []
     if os.path.exists(env_path):
@@ -621,7 +652,7 @@ def save_env(config: dict):
 
 
 def reload_config():
-    """Relit le .env et met à jour les globals du module."""
+    """Re-read the .env file and update the module globals."""
     global QB_HOST, QB_PORT, QB_USER, QB_PASS, STORAGE_DIR, LAST_ACTIVITY_DAYS, BASE_URL
     for k in ("QB_HOST", "QB_PORT", "QB_USER", "QB_PASS", "STORAGE_DIR", "LAST_ACTIVITY_DAYS"):
         os.environ.pop(k, None)
@@ -638,20 +669,20 @@ def reload_config():
 def main():
     parser = argparse.ArgumentParser(description="qBittorrent Orphan Cleaner")
     parser.add_argument("--debug", action="store_true",
-                        help="Pour chaque orphelin, affiche les données brutes de l'API qBittorrent")
+                        help="For each orphan, print the raw qBittorrent API data")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Liste les orphelins sans rien supprimer")
+                        help="List the orphans without deleting anything")
     parser.add_argument("--auto-delete", action="store_true",
-                        help="Supprime tous les orphelins sans interaction (pour cron)")
+                        help="Delete all orphans without interaction (for cron)")
     parser.add_argument("--output", metavar="FILE",
-                        help="Exporte les orphelins en CSV ou JSON (.csv / .json)")
+                        help="Export the orphans to CSV or JSON (.csv / .json)")
     args = parser.parse_args()
 
     print("=" * 60)
     print(f"  qBittorrent Orphan Cleaner  v{__version__}")
     print("=" * 60)
-    print(f"\nRépertoire audité : {STORAGE_DIR}")
-    print(f"WebUI             : {BASE_URL}\n")
+    print(f"\nAudited directory: {STORAGE_DIR}")
+    print(f"WebUI            : {BASE_URL}\n")
 
     try:
         client = QBittorrentClient()
@@ -667,14 +698,14 @@ def main():
         print_tracker_warnings(scan["tracker_warnings"])
         print_inactive_torrent_warnings(scan["inactive_torrents"])
         known_count = sum(len(names) for names in known_by_scope.values())
-        print(f"[INFO] {known_count} nom(s) référencé(s) par les torrents")
+        print(f"[INFO] {known_count} name(s) referenced by the torrents")
         if category_dirs:
             cat_names = ", ".join(sorted(category_dirs))
-            print(f"[INFO] {len(category_dirs)} répertoire(s) de catégorie : {cat_names}")
+            print(f"[INFO] {len(category_dirs)} category folder(s): {cat_names}")
     except QbtError as e:
-        print(f"[ERREUR] {e}")
+        print(f"[ERROR] {e}")
         sys.exit(1)
-    print(f"[INFO] {len(entries)} entrée(s) trouvée(s) dans {STORAGE_DIR}")
+    print(f"[INFO] {len(entries)} entry/entries found in {STORAGE_DIR}")
 
     orphans = [
         (entry, get_entry_size(entry))
@@ -683,13 +714,13 @@ def main():
 
     if args.debug:
         print("\n" + "─" * 60)
-        print("  MODE DEBUG — analyse des orphelins détectés")
+        print("  DEBUG MODE — analysis of detected orphans")
         print("─" * 60)
         for entry, _ in orphans:
             rel = _entry_rel_path(entry)
             print(f"\n[DEBUG] {rel!r}")
-            print(f"  nom recherché : {_entry_name(entry)!r}")
-            print(f"  portée        : {getattr(entry, 'category', '') or '(racine)'}")
+            print(f"  searched name : {_entry_name(entry)!r}")
+            print(f"  scope         : {getattr(entry, 'category', '') or '(root)'}")
             matches = [
                 t for t in torrents
                 if _entry_name(entry).lower() in t.get("name", "").lower()
@@ -697,30 +728,30 @@ def main():
                 or _entry_name(entry).lower() in t.get("save_path", "").lower()
             ]
             if matches:
-                print(f"  → {len(matches)} correspondance(s) partielle(s) dans l'API :")
+                print(f"  → {len(matches)} partial match(es) in the API:")
                 for t in matches:
                     print(f"    name         = {t.get('name', '')!r}")
                     print(f"    content_path = {t.get('content_path', '')!r}")
                     print(f"    save_path    = {t.get('save_path', '')!r}")
                     item = os.path.basename(t.get("content_path", "").rstrip("/\\")) or t.get("name", "")
-                    print(f"    item extrait = {item!r}")
+                    print(f"    extracted item = {item!r}")
             else:
-                print("  → aucune correspondance dans l'API (orphelin probable)")
+                print("  → no match in the API (likely orphan)")
         print("\n" + "─" * 60)
         sys.exit(0)
 
     if not orphans:
-        print("\n[✓] Aucun fichier orphelin. Le stockage est propre !")
+        print("\n[✓] No orphan file. Storage is clean!")
         sys.exit(0)
 
-    # Export optionnel avant toute action
+    # Optional export before any action
     if args.output:
         export_report(orphans, args.output)
 
-    # --dry-run : afficher uniquement, sans supprimer
+    # --dry-run: display only, no deletion
     if args.dry_run:
         print("\n" + "─" * 60)
-        print("  MODE DRY-RUN — aucune suppression effectuée")
+        print("  DRY-RUN MODE — no deletion performed")
         print("─" * 60)
         total = 0
         for i, (entry, size) in enumerate(orphans, 1):
@@ -728,13 +759,13 @@ def main():
             rel = _entry_rel_path(entry)
             print(f"  [{i:>3}] {kind} {rel}  ({format_size(size)})")
             total += size
-        print(f"\n  Taille totale récupérable : {format_size(total)}")
+        print(f"\n  Total recoverable size: {format_size(total)}")
         print("─" * 60)
         sys.exit(0)
 
-    # --auto-delete : suppression directe sans interaction
+    # --auto-delete: direct deletion without interaction
     if args.auto_delete:
-        print(f"\n[AUTO] Suppression de {len(orphans)} orphelin(s)…")
+        print(f"\n[AUTO] Deleting {len(orphans)} orphan(s)…")
         _delete_entries([e for e, _ in orphans])
         sys.exit(0)
 

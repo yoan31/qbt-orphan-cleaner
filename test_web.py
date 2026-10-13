@@ -1,3 +1,4 @@
+import errno
 import os
 import tempfile
 import time
@@ -35,6 +36,25 @@ class WebSecurityTests(unittest.TestCase):
             f.write(content)
         return path
 
+    def test_qbittorrent_login_accepts_legacy_200_response(self):
+        client = web._qbt.QBittorrentClient()
+        client._post_response = lambda path, data: (200, "Ok.")
+
+        client.login()
+
+    def test_qbittorrent_login_accepts_5_2_no_content_response(self):
+        client = web._qbt.QBittorrentClient()
+        client._post_response = lambda path, data: (204, "")
+
+        client.login()
+
+    def test_qbittorrent_login_rejects_unsuccessful_legacy_response(self):
+        client = web._qbt.QBittorrentClient()
+        client._post_response = lambda path, data: (200, "Fails.")
+
+        with self.assertRaises(web._qbt.QbtError):
+            client.login()
+
     def scan_with_torrents(self, torrents):
         class FakeClient:
             def get_torrents(self):
@@ -68,7 +88,7 @@ class WebSecurityTests(unittest.TestCase):
 
         self.assertTrue(os.path.exists(victim))
         self.assertEqual(result["deleted"], [])
-        self.assertEqual(result["errors"][0]["error"], "Chemin non autorisé")
+        self.assertEqual(result["errors"][0]["error"], "Path not allowed")
 
     def test_delete_revalidates_current_orphans(self):
         managed = os.path.join(self.storage, "managed.txt")
@@ -80,7 +100,7 @@ class WebSecurityTests(unittest.TestCase):
 
         self.assertTrue(os.path.exists(managed))
         self.assertEqual(result["deleted"], [])
-        self.assertEqual(result["errors"][0]["error"], "Chemin non orphelin")
+        self.assertEqual(result["errors"][0]["error"], "Path is not an orphan")
 
     def test_delete_allows_current_orphan_inside_storage(self):
         orphan = os.path.join(self.storage, "orphan.txt")
@@ -94,6 +114,23 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(result["deleted"], [orphan])
         self.assertEqual(result["errors"], [])
 
+    def test_delete_reports_read_only_storage(self):
+        orphan = os.path.join(self.storage, "orphan-dir")
+        os.mkdir(orphan)
+        web._current_orphan_realpaths = lambda: {web._safe_storage_path(orphan): {}}
+        old_rmtree = web.shutil.rmtree
+        web.shutil.rmtree = lambda path: (_ for _ in ()).throw(
+            OSError(errno.EROFS, "Read-only file system", path)
+        )
+        try:
+            result = web.do_delete([orphan])
+        finally:
+            web.shutil.rmtree = old_rmtree
+
+        self.assertTrue(os.path.isdir(orphan))
+        self.assertEqual(result["deleted"], [])
+        self.assertEqual(result["errors"][0]["error"], "Storage mounted read-only")
+
     def test_delete_torrent_requires_inactive_hash(self):
         calls = []
 
@@ -103,6 +140,9 @@ class WebSecurityTests(unittest.TestCase):
 
             def get_torrents(self):
                 return [{"hash": "abc", "last_activity": int(time.time()), "size": 1}]
+
+            def get_trackers(self, torrent_hash):
+                return [{"status": 2}]
 
             def delete_torrent(self, torrent_hash, delete_files=True):
                 calls.append((torrent_hash, delete_files))
@@ -114,6 +154,30 @@ class WebSecurityTests(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertEqual(calls, [])
+
+    def test_delete_torrent_allows_tracker_warning_hash(self):
+        calls = []
+
+        class FakeClient:
+            def login(self):
+                pass
+
+            def get_torrents(self):
+                return [{"hash": "abc", "last_activity": int(time.time()), "size": 1}]
+
+            def get_trackers(self, torrent_hash):
+                return [{"status": 4, "url": "https://tracker.example/announce"}]
+
+            def delete_torrent(self, torrent_hash, delete_files=True):
+                calls.append((torrent_hash, delete_files))
+
+        web._qbt.QBittorrentClient = FakeClient
+        web._qbt.LAST_ACTIVITY_DAYS = 30
+
+        result = web.delete_torrent_with_files("abc")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(calls, [("abc", True)])
 
     def test_delete_torrent_allows_inactive_hash(self):
         calls = []
@@ -135,6 +199,69 @@ class WebSecurityTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(calls, [("abc", True)])
+
+    def test_delete_torrents_batch_deletes_eligible_and_reports_ineligible(self):
+        calls = []
+
+        class FakeClient:
+            def login(self):
+                pass
+
+            def get_torrents(self):
+                return [
+                    {"hash": "abc", "last_activity": 0, "size": 1},
+                    {"hash": "def", "last_activity": 0, "size": 1},
+                    {"hash": "ghi", "last_activity": int(time.time()), "size": 1},
+                ]
+
+            def get_trackers(self, torrent_hash):
+                return [{"status": 2}]
+
+            def delete_torrent(self, torrent_hash, delete_files=True):
+                calls.append((torrent_hash, delete_files))
+
+        web._qbt.QBittorrentClient = FakeClient
+        web._qbt.LAST_ACTIVITY_DAYS = 30
+
+        result = web.delete_torrents_with_files(["abc", "ghi", "def"])
+
+        self.assertEqual(sorted(result["deleted"]), ["abc", "def"])
+        self.assertEqual([c[0] for c in calls], ["abc", "def"])
+        self.assertTrue(all(c[1] is True for c in calls))
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertEqual(result["errors"][0]["hash"], "ghi")
+
+    def test_delete_torrents_batch_reports_empty_hash_without_blocking(self):
+        calls = []
+
+        class FakeClient:
+            def login(self):
+                pass
+
+            def get_torrents(self):
+                return [{"hash": "abc", "last_activity": 0, "size": 1}]
+
+            def get_trackers(self, torrent_hash):
+                return [{"status": 2}]
+
+            def delete_torrent(self, torrent_hash, delete_files=True):
+                calls.append((torrent_hash, delete_files))
+
+        web._qbt.QBittorrentClient = FakeClient
+        web._qbt.LAST_ACTIVITY_DAYS = 30
+
+        result = web.delete_torrents_with_files(["", "abc"])
+
+        self.assertEqual(result["deleted"], ["abc"])
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertEqual(result["errors"][0]["error"], "Missing torrent hash")
+        self.assertEqual(calls, [("abc", True)])
+
+    def test_delete_torrent_with_files_requires_hash(self):
+        result = web.delete_torrent_with_files("")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "Missing torrent hash")
 
     def test_config_validation_rejects_bad_port_before_save(self):
         with self.assertRaises(web.WebError):
